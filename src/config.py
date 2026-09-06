@@ -18,6 +18,6 @@ REGRESSION_LOSS_WEIGHT = 0.5
 EARLY_STOPPING_PATIENCE = 7
 RANDOM_SEED = 42
 RANGE_HALF_WIDTH = 0.5
-SPLITS = ("train", "valid", "test")
+SPLITS = ("train","test")
 FRUIT_NAMES = ("banana", "mango")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
