@@ -485,7 +485,6 @@ class FruitDataset(Dataset):
                         scale=(0.85, 1.0),
                     ),
                     transforms.RandomHorizontalFlip(),
-                    transforms.RandomRotation(8),
                     transforms.ColorJitter(
                         brightness=0.12,
                         saturation=0.12,
