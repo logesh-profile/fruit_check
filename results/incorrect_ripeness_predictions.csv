@@ -1,0 +1,5 @@
+image,fruit_actual,fruit_predicted,fruit_confidence_percent,fruit_correct,ripeness_actual,ripeness_predicted,ripeness_confidence_percent,ripeness_correct
+C:\fruit_checking\dataset\mango\unripe\test\IMG20200715102719.jpg,mango,mango,100.0,True,unripe,ripe,99.57,False
+C:\fruit_checking\dataset\mango\unripe\test\IMG20200715105731.jpg,mango,mango,100.0,True,unripe,ripe,100.0,False
+C:\fruit_checking\dataset\mango\unripe\Test\IMG20200715102719.jpg,mango,mango,100.0,True,unripe,ripe,99.57,False
+C:\fruit_checking\dataset\mango\unripe\Test\IMG20200715105731.jpg,mango,mango,100.0,True,unripe,ripe,100.0,False
