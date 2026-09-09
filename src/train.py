@@ -26,55 +26,89 @@ def build_mappings(
     samples_by_split: dict,
 ) -> tuple[dict[str, int], dict[str, int]]:
     """
-    Build mappings for fruit and ripeness labels.
+    Use fixed class mappings so training and prediction
+    always use the same class indices.
 
-    Example:
+    Fruit:
+        banana   -> 0
+        mango    -> 1
+        no_fruit -> 2
 
-        banana -> 0
-        mango  -> 1
-
+    Ripeness:
         overripe -> 0
         ripe     -> 1
         unripe   -> 2
+
+    No_Fruit samples have no ripeness label, so None
+    values are ignored when building ripeness mappings.
     """
 
-    fruit_names = sorted(
-        {
-            sample.fruit_name
-            for samples in samples_by_split.values()
-            for sample in samples
-        }
-    )
-
-    ripeness_names = sorted(
-        {
-            sample.ripeness_name
-            for samples in samples_by_split.values()
-            for sample in samples
-        }
-    )
-
-    if not fruit_names:
-        raise RuntimeError(
-            "No fruit classes were found in the training dataset."
-        )
-
-    if not ripeness_names:
-        raise RuntimeError(
-            "No ripeness classes were found in the training dataset."
-        )
-
+    # ---------------------------------------------------------
+    # FIXED FRUIT MAPPING
+    # ---------------------------------------------------------
     fruit_to_index = {
-        name: index
-        for index, name in enumerate(fruit_names)
+        "banana": 0,
+        "mango": 1,
+        "no_fruit": 2,
     }
 
+    # ---------------------------------------------------------
+    # FIXED RIPENESS MAPPING
+    # ---------------------------------------------------------
     ripeness_to_index = {
-        name: index
-        for index, name in enumerate(ripeness_names)
+        "overripe": 0,
+        "ripe": 1,
+        "unripe": 2,
     }
 
-    return fruit_to_index, ripeness_to_index
+    # ---------------------------------------------------------
+    # FIND CLASSES PRESENT IN DATASET
+    # ---------------------------------------------------------
+    found_fruits = {
+        sample.fruit_name
+        for samples in samples_by_split.values()
+        for sample in samples
+    }
+
+    found_ripeness = {
+        sample.ripeness_name
+        for samples in samples_by_split.values()
+        for sample in samples
+        if sample.ripeness_name is not None
+    }
+
+    # ---------------------------------------------------------
+    # CHECK REQUIRED FRUIT CLASSES
+    # ---------------------------------------------------------
+    missing_fruits = (
+        set(fruit_to_index)
+        - found_fruits
+    )
+
+    if missing_fruits:
+        raise RuntimeError(
+            "Missing required fruit classes: "
+            f"{sorted(missing_fruits)}"
+        )
+
+    # ---------------------------------------------------------
+    # CHECK REQUIRED RIPENESS CLASSES
+    # ---------------------------------------------------------
+    missing_ripeness = (
+        set(ripeness_to_index)
+        - found_ripeness
+    )
+
+    if missing_ripeness:
+        raise RuntimeError(
+            "Missing required ripeness classes: "
+            f"{sorted(missing_ripeness)}"
+        )
+
+    return (
+        fruit_to_index,
+        ripeness_to_index,
+    )
 
 
 def freeze_all_backbone(model):
@@ -92,24 +126,23 @@ def unfreeze_last_backbone_blocks(
 ):
     """
     Unfreeze only the final EfficientNetV2-S feature blocks.
-
-    This gives us useful fine-tuning while keeping GPU
-    memory and computation manageable on a 6 GB RTX 3050.
     """
 
-    # First freeze everything.
     freeze_all_backbone(model)
 
-    # EfficientNetV2-S feature blocks.
-    backbone_blocks = list(model.features.children())
+    backbone_blocks = list(
+        model.features.children()
+    )
 
     if len(backbone_blocks) < num_blocks:
         raise RuntimeError(
-            "EfficientNet backbone has fewer blocks than requested."
+            "EfficientNet backbone has fewer "
+            "blocks than requested."
         )
 
-    # Unfreeze only the final blocks.
-    for block in backbone_blocks[-num_blocks:]:
+    for block in backbone_blocks[
+        -num_blocks:
+    ]:
         for parameter in block.parameters():
             parameter.requires_grad = True
 
@@ -125,14 +158,16 @@ def _run_classification_epoch(
     scaler=None,
 ):
     """
-    Run one training epoch.
+    Run one image-classification epoch.
 
-    Only image features are used in this phase.
+    Fruit classification:
+        banana / mango / no_fruit
 
-    Temperature, humidity and days_remaining are intentionally
-    NOT used yet because the current phase is image-only training.
+    Ripeness classification:
+        unripe / ripe / overripe
 
-    CUDA mixed precision is used when available.
+    No_Fruit samples have ripeness = -1 and therefore
+    are excluded from the ripeness loss and accuracy.
     """
 
     if training:
@@ -141,9 +176,12 @@ def _run_classification_epoch(
         model.eval()
 
     total_loss = 0.0
+
     correct_fruit = 0
     correct_ripeness = 0
-    total = 0
+
+    total_fruit = 0
+    total_ripeness = 0
 
     for batch in loader:
 
@@ -169,50 +207,85 @@ def _run_classification_epoch(
 
         with torch.set_grad_enabled(training):
 
-            # -----------------------------------------------------
-            # Mixed precision
-            # -----------------------------------------------------
             with torch.amp.autocast(
                 device_type=device.type,
                 enabled=(device.type == "cuda"),
             ):
 
                 # -------------------------------------------------
-                # EfficientNetV2-S extracts image features
+                # Extract image features
                 # -------------------------------------------------
                 features = model.encode_image(
                     images
                 )
 
                 # -------------------------------------------------
-                # Fruit classification:
-                # banana / mango
+                # Fruit classification
                 # -------------------------------------------------
                 fruit_logits = model.fruit_head(
                     features
                 )
 
                 # -------------------------------------------------
-                # Ripeness classification:
-                # unripe / ripe / overripe
+                # Ripeness classification
                 # -------------------------------------------------
                 ripeness_logits = model.ripeness_head(
                     features
                 )
 
                 # -------------------------------------------------
-                # Classification losses
+                # Fruit loss
+                #
+                # ALL images participate:
+                # banana + mango + no_fruit
                 # -------------------------------------------------
                 fruit_loss_value = fruit_loss(
                     fruit_logits,
                     fruit_targets,
                 )
 
-                ripeness_loss_value = ripeness_loss(
-                    ripeness_logits,
-                    ripeness_targets,
+                # -------------------------------------------------
+                # Ripeness loss
+                #
+                # ONLY actual fruit images participate.
+                #
+                # No_Fruit has target = -1.
+                # -------------------------------------------------
+                valid_ripeness_mask = (
+                    ripeness_targets >= 0
                 )
 
+                if valid_ripeness_mask.any():
+
+                    valid_ripeness_logits = (
+                        ripeness_logits[
+                            valid_ripeness_mask
+                        ]
+                    )
+
+                    valid_ripeness_targets = (
+                        ripeness_targets[
+                            valid_ripeness_mask
+                        ]
+                    )
+
+                    ripeness_loss_value = (
+                        ripeness_loss(
+                            valid_ripeness_logits,
+                            valid_ripeness_targets,
+                        )
+                    )
+
+                else:
+
+                    ripeness_loss_value = torch.zeros(
+                        (),
+                        device=device,
+                    )
+
+                # -------------------------------------------------
+                # Combined loss
+                # -------------------------------------------------
                 loss = (
                     fruit_loss_value
                     + ripeness_loss_value
@@ -224,17 +297,26 @@ def _run_classification_epoch(
             if training:
 
                 if scaler is not None:
-                    scaler.scale(loss).backward()
 
-                    scaler.step(optimizer)
+                    scaler.scale(
+                        loss
+                    ).backward()
+
+                    scaler.step(
+                        optimizer
+                    )
 
                     scaler.update()
 
                 else:
+
                     loss.backward()
 
                     optimizer.step()
 
+        # ---------------------------------------------------------
+        # Statistics
+        # ---------------------------------------------------------
         batch_size = images.size(0)
 
         total_loss += (
@@ -242,27 +324,61 @@ def _run_classification_epoch(
             * batch_size
         )
 
-        correct_fruit += (
+        # ---------------------------------------------------------
+        # Fruit accuracy
+        # ---------------------------------------------------------
+        fruit_predictions = (
             fruit_logits.argmax(dim=1)
+        )
+
+        correct_fruit += (
+            fruit_predictions
             == fruit_targets
         ).sum().item()
 
-        correct_ripeness += (
-            ripeness_logits.argmax(dim=1)
-            == ripeness_targets
-        ).sum().item()
+        total_fruit += batch_size
 
-        total += batch_size
+        # ---------------------------------------------------------
+        # Ripeness accuracy
+        # Only actual fruit images.
+        # ---------------------------------------------------------
+        if valid_ripeness_mask.any():
 
-    if total == 0:
+            ripeness_predictions = (
+                ripeness_logits.argmax(
+                    dim=1
+                )
+            )
+
+            correct_ripeness += (
+                ripeness_predictions[
+                    valid_ripeness_mask
+                ]
+                == ripeness_targets[
+                    valid_ripeness_mask
+                ]
+            ).sum().item()
+
+            total_ripeness += (
+                valid_ripeness_mask.sum().item()
+            )
+
+    if total_fruit == 0:
         raise RuntimeError(
-            "The training dataset contains no valid images."
+            "The training dataset contains "
+            "no valid images."
         )
 
     return {
-        "loss": total_loss / total,
-        "fruit_accuracy": correct_fruit / total,
-        "ripeness_accuracy": correct_ripeness / total,
+        "loss": total_loss / total_fruit,
+        "fruit_accuracy": (
+            correct_fruit / total_fruit
+        ),
+        "ripeness_accuracy": (
+            correct_ripeness / total_ripeness
+            if total_ripeness > 0
+            else 0.0
+        ),
     }
 
 
@@ -273,9 +389,9 @@ def save_checkpoint(
     training_loss,
 ):
     """
-    Save the current best training checkpoint.
+    Save the best image-classification checkpoint.
 
-    Regression remains disabled in this phase.
+    Regression is NOT trained in this phase.
     """
 
     MODEL_DIR.mkdir(
@@ -290,9 +406,16 @@ def save_checkpoint(
 
         "ripeness_to_index": ripeness_to_index,
 
+        "num_fruit_classes": len(
+            fruit_to_index
+        ),
+
+        "num_ripeness_classes": len(
+            ripeness_to_index
+        ),
+
         "image_size": IMAGE_SIZE,
 
-        # Regression is NOT trained yet.
         "regression_available": False,
 
         "training_loss": training_loss,
@@ -334,6 +457,7 @@ def train_model() -> None:
     print("=" * 60)
 
     print()
+
     print(
         "Dataset:",
         DATASET_DIR,
@@ -353,31 +477,31 @@ def train_model() -> None:
 
     print()
 
-    # -------------------------------------------------------------
-    # IMPORTANT:
-    #
-    # Explicitly request ONLY train and test.
-    #
-    # dataset.py ignores validation folders.
-    # -------------------------------------------------------------
-    samples_by_split, counts, problems = discover_samples(
-        DATASET_DIR,
-        ("train", "test"),
+    # ---------------------------------------------------------
+    # DISCOVER ONLY TRAIN + TEST
+    # ---------------------------------------------------------
+    samples_by_split, counts, problems = (
+        discover_samples(
+            DATASET_DIR,
+            ("train", "test"),
+        )
     )
 
-    # -------------------------------------------------------------
-    # Dataset warnings
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------
+    # DATASET WARNINGS
+    # ---------------------------------------------------------
     if problems:
 
         print("Dataset warnings:")
 
         for problem in problems[:20]:
+
             print(
                 f"  - {problem}"
             )
 
         if len(problems) > 20:
+
             print(
                 f"  ... and "
                 f"{len(problems) - 20} "
@@ -386,38 +510,39 @@ def train_model() -> None:
 
         print()
 
-    # -------------------------------------------------------------
-    # TRAIN is mandatory.
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------
+    # TRAINING DATA REQUIRED
+    # ---------------------------------------------------------
     if not samples_by_split["train"]:
 
         raise RuntimeError(
             "No training images were found."
         )
 
-    # -------------------------------------------------------------
-    # TEST is mandatory.
-    #
-    # It is NOT used during training.
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------
+    # TEST DATA REQUIRED
+    # ---------------------------------------------------------
     if not samples_by_split["test"]:
 
         raise RuntimeError(
             "No test images were found."
         )
 
-    # -------------------------------------------------------------
-    # Build class mappings.
-    # -------------------------------------------------------------
-    fruit_to_index, ripeness_to_index = (
-        build_mappings(
-            samples_by_split
-        )
+    # ---------------------------------------------------------
+    # BUILD FIXED MAPPINGS
+    # ---------------------------------------------------------
+    (
+        fruit_to_index,
+        ripeness_to_index,
+    ) = build_mappings(
+        samples_by_split
     )
 
     print("Fruit classes:")
 
-    for name, index in fruit_to_index.items():
+    for name, index in (
+        fruit_to_index.items()
+    ):
 
         print(
             f"  {index}: {name}"
@@ -427,7 +552,9 @@ def train_model() -> None:
 
     print("Ripeness classes:")
 
-    for name, index in ripeness_to_index.items():
+    for name, index in (
+        ripeness_to_index.items()
+    ):
 
         print(
             f"  {index}: {name}"
@@ -435,9 +562,9 @@ def train_model() -> None:
 
     print()
 
-    # -------------------------------------------------------------
-    # Dataset counts
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------
+    # DATASET COUNTS
+    # ---------------------------------------------------------
     print("Dataset counts:")
 
     for key, count in sorted(
@@ -446,10 +573,16 @@ def train_model() -> None:
 
         fruit_name, split, ripeness_name = key
 
+        ripeness_display = (
+            "none"
+            if ripeness_name is None
+            else ripeness_name
+        )
+
         print(
             f"  {fruit_name:8s} | "
             f"{split:5s} | "
-            f"{ripeness_name:10s} | "
+            f"{ripeness_display:10s} | "
             f"{count}"
         )
 
@@ -467,9 +600,9 @@ def train_model() -> None:
 
     print()
 
-    # -------------------------------------------------------------
-    # TRAIN DATASET ONLY
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------
+    # TRAIN DATASET
+    # ---------------------------------------------------------
     train_dataset = FruitDataset(
         samples=samples_by_split["train"],
         fruit_to_index=fruit_to_index,
@@ -478,12 +611,9 @@ def train_model() -> None:
         image_size=IMAGE_SIZE,
     )
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------
     # TRAIN DATALOADER
-    #
-    # Batch size is controlled by config.py.
-    # Recommended: 8 for RTX 3050 6 GB.
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
@@ -495,9 +625,9 @@ def train_model() -> None:
         ),
     )
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------
     # DEVICE
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------
     device = torch.device(
         "cuda"
         if torch.cuda.is_available()
@@ -523,12 +653,15 @@ def train_model() -> None:
 
     print()
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------
     # LOAD PRETRAINED EFFICIENTNETV2-S
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------
     model = FruitRipenessModel(
         num_ripeness_classes=len(
             ripeness_to_index
+        ),
+        num_fruit_classes=len(
+            fruit_to_index
         ),
         pretrained=True,
     ).to(device)
@@ -539,13 +672,12 @@ def train_model() -> None:
 
     print()
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------
     # STAGE 1
     #
-    # Freeze entire EfficientNet backbone.
-    #
-    # Only classification heads train.
-    # -------------------------------------------------------------
+    # Freeze EfficientNet backbone.
+    # Train classification heads.
+    # ---------------------------------------------------------
     freeze_all_backbone(
         model
     )
@@ -571,16 +703,16 @@ def train_model() -> None:
         )
     )
 
-    # -------------------------------------------------------------
-    # Classification losses
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------
+    # LOSSES
+    # ---------------------------------------------------------
     fruit_loss = nn.CrossEntropyLoss()
 
     ripeness_loss = nn.CrossEntropyLoss()
 
-    # -------------------------------------------------------------
-    # CUDA AMP scaler
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------
+    # CUDA AMP
+    # ---------------------------------------------------------
     scaler = torch.amp.GradScaler(
         "cuda",
         enabled=(
@@ -588,12 +720,12 @@ def train_model() -> None:
         ),
     )
 
-    # -------------------------------------------------------------
-    # Track best TRAINING loss.
+    # ---------------------------------------------------------
+    # BEST TRAINING LOSS
     #
     # No validation.
-    # Test is never used for selection.
-    # -------------------------------------------------------------
+    # Test is not used here.
+    # ---------------------------------------------------------
     best_loss = float("inf")
 
     best_epoch = 0
@@ -613,7 +745,8 @@ def train_model() -> None:
     )
 
     print(
-        f"Initial frozen epochs: {STAGE_1_EPOCHS}"
+        f"Initial frozen epochs: "
+        f"{STAGE_1_EPOCHS}"
     )
 
     print(
@@ -627,28 +760,27 @@ def train_model() -> None:
 
     print()
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------
     # TRAINING LOOP
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------
     for epoch in range(
         NUM_EPOCHS
     ):
 
-        # ---------------------------------------------------------
+        # -----------------------------------------------------
         # STAGE 2
         #
-        # After STAGE_1_EPOCHS:
-        #
-        # Freeze early EfficientNet blocks.
-        # Unfreeze only final 2 blocks.
-        # ---------------------------------------------------------
+        # Unfreeze final 2 EfficientNet blocks.
+        # -----------------------------------------------------
         if epoch == STAGE_1_EPOCHS:
 
             print()
+
             print(
                 "Fine-tuning final 2 "
                 "EfficientNetV2-S blocks..."
             )
+
             print()
 
             unfreeze_last_backbone_blocks(
@@ -656,9 +788,6 @@ def train_model() -> None:
                 num_blocks=2,
             )
 
-            # -----------------------------------------------------
-            # Create optimizer using only trainable parameters.
-            # -----------------------------------------------------
             trainable_parameters = [
                 parameter
                 for parameter in model.parameters()
@@ -680,9 +809,9 @@ def train_model() -> None:
                 )
             )
 
-        # ---------------------------------------------------------
-        # Train one epoch.
-        # ---------------------------------------------------------
+        # -----------------------------------------------------
+        # RUN TRAINING EPOCH
+        # -----------------------------------------------------
         train_metrics = (
             _run_classification_epoch(
                 model=model,
@@ -696,9 +825,9 @@ def train_model() -> None:
             )
         )
 
-        # ---------------------------------------------------------
-        # Scheduler
-        # ---------------------------------------------------------
+        # -----------------------------------------------------
+        # SCHEDULER
+        # -----------------------------------------------------
         scheduler.step(
             train_metrics["loss"]
         )
@@ -707,9 +836,9 @@ def train_model() -> None:
             optimizer.param_groups[0]["lr"]
         )
 
-        # ---------------------------------------------------------
-        # Print metrics
-        # ---------------------------------------------------------
+        # -----------------------------------------------------
+        # PRINT METRICS
+        # -----------------------------------------------------
         print(
             f"Epoch "
             f"[{epoch + 1:02d}/{NUM_EPOCHS}] "
@@ -719,12 +848,9 @@ def train_model() -> None:
             f"lr={current_lr:.2e}"
         )
 
-        # ---------------------------------------------------------
-        # Save best training checkpoint.
-        #
-        # Validation is NOT used.
-        # Test is NOT used.
-        # ---------------------------------------------------------
+        # -----------------------------------------------------
+        # SAVE BEST TRAINING CHECKPOINT
+        # -----------------------------------------------------
         if (
             train_metrics["loss"]
             < best_loss
@@ -753,9 +879,9 @@ def train_model() -> None:
                 f"(epoch {best_epoch})"
             )
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------
     # TRAINING COMPLETE
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------
     print()
 
     print("=" * 60)
@@ -785,8 +911,7 @@ def train_model() -> None:
     )
 
     print(
-        "Run evaluate.py next to measure performance "
-        "on the held-out test set."
+        "The test set is reserved for final evaluation."
     )
 
     print()

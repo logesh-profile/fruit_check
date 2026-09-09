@@ -1,4 +1,3 @@
-import csv
 import math
 from collections import Counter
 from dataclasses import dataclass
@@ -8,178 +7,180 @@ from PIL import Image, UnidentifiedImageError
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-from config import CSV_PATH, DATASET_DIR, FRUIT_NAMES, IMAGE_EXTENSIONS, SPLITS
+from config import DATASET_DIR, IMAGE_EXTENSIONS
 
+
+# ============================================================
+# LABELS
+# ============================================================
+
+FRUIT_NAMES = (
+    "banana",
+    "mango",
+    "no_fruit",
+)
+
+RIPENESS_NAMES = (
+    "unripe",
+    "ripe",
+    "overripe",
+)
+
+
+# ============================================================
+# SAMPLE
+# ============================================================
 
 @dataclass(frozen=True)
 class Sample:
     image_path: Path
     fruit_name: str
-    ripeness_name: str
+    ripeness_name: str | None = None
+
+    # Kept for future MLP/regression integration.
     temperature: float | None = None
     humidity: float | None = None
     days_remaining: float | None = None
 
 
+# ============================================================
+# LABEL NORMALISATION
+# ============================================================
+
 def normalise_label(value: str) -> str:
-    """Convert labels such as 'Over-Ripe', 'over_ripe' to 'over ripe'."""
+    """
+    Convert labels such as:
+
+        Over-Ripe
+        over_ripe
+        OVER RIPE
+
+    into:
+
+        over ripe
+    """
+
     return " ".join(
-        value.strip().lower().replace("_", " ").replace("-", " ").split()
+        value.strip()
+        .lower()
+        .replace("_", " ")
+        .replace("-", " ")
+        .split()
     )
 
 
-def inspect_csv(csv_path: Path = CSV_PATH) -> dict:
+def normalise_ripeness_label(value: str) -> str:
     """
-    Inspect the sensor CSV.
-
-    This is kept for the future temperature/humidity/regression phase.
-    It is NOT used to train the current image-only model.
+    Convert folder names to our standard ripeness labels.
     """
-    if not csv_path.exists():
-        raise FileNotFoundError(f"CSV file not found: {csv_path}")
 
-    with csv_path.open(newline="", encoding="utf-8-sig") as handle:
-        reader = csv.DictReader(handle)
-        columns = reader.fieldnames or []
-        rows = list(reader)
+    label = normalise_label(value)
 
-    if not rows:
-        raise ValueError(f"CSV contains no data rows: {csv_path}")
+    aliases = {
+        "unripe": "unripe",
+        "un ripe": "unripe",
 
-    missing = {
-        column: sum(
-            not (row.get(column) or "").strip()
-            for row in rows
+        "ripe": "ripe",
+
+        "overripe": "overripe",
+        "over ripe": "overripe",
+    }
+
+    if label not in aliases:
+        raise ValueError(
+            f"Unknown ripeness class: {value!r}"
         )
-        for column in columns
-    }
 
-    numeric = {}
-
-    for column in columns:
-        values = []
-        invalid = 0
-
-        for row in rows:
-            try:
-                values.append(float((row.get(column) or "").strip()))
-            except (TypeError, ValueError):
-                invalid += 1
-
-        if values:
-            numeric[column] = {
-                "invalid": invalid,
-                "min": min(values),
-                "max": max(values),
-            }
-
-    lowered = {
-        column.lower(): column
-        for column in columns
-    }
-
-    return {
-        "columns": columns,
-        "rows": len(rows),
-        "missing": missing,
-        "numeric": numeric,
-        "fruit_values": sorted(
-            {
-                row.get(lowered.get("fruit", ""), "")
-                for row in rows
-            }
-        ),
-        "stage_values": sorted(
-            {
-                row.get(lowered.get("stage", ""), "")
-                for row in rows
-            }
-        ),
-        "duplicate_rows": len(rows)
-        - len({tuple(row.items()) for row in rows}),
-        "image_column": next(
-            (
-                column
-                for column in columns
-                if "image" in column.lower()
-                or "path" in column.lower()
-            ),
-            None,
-        ),
-        "group_column": next(
-            (
-                column
-                for column in columns
-                if any(
-                    term in column.lower()
-                    for term in (
-                        "fruit_id",
-                        "fruit id",
-                        "sample_id",
-                        "sample id",
-                        "observation",
-                        "image_id",
-                        "date",
-                        "day",
-                    )
-                )
-            ),
-            None,
-        ),
-    }
+    return aliases[label]
 
 
-# ---------------------------------------------------------------------
-# DATASET STRUCTURE HANDLING
-# ---------------------------------------------------------------------
-#
-# This project intentionally uses ONLY:
-#
-#     train
-#     test
-#
-# The following are supported:
-#
-# 1. fruit/train/class/image.jpg
-# 2. fruit/test/class/image.jpg
-#
-# 3. fruit/Training/class/image.jpg
-# 4. fruit/Test/class/image.jpg
-#
-# 5. fruit/class/train/image.jpg
-# 6. fruit/class/test/image.jpg
-#
-# 7. fruit/class/Training/image.jpg
-# 8. fruit/class/Test/image.jpg
-#
-# IMPORTANT:
-# valid / Valid folders are NEVER scanned.
-# ---------------------------------------------------------------------
-
-
-SPLIT_NAMES = {
-    "train": ("train", "Training"),
-    "test": ("test", "Test"),
-}
-
+# ============================================================
+# IMAGE HELPERS
+# ============================================================
 
 def _is_image(path: Path) -> bool:
-    return path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    return (
+        path.is_file()
+        and path.suffix.lower() in IMAGE_EXTENSIONS
+    )
 
 
 def _verify_image(
     image_path: Path,
     problems: list[str],
 ) -> bool:
-    """Check whether an image can actually be opened."""
+    """
+    Verify that the image can actually be opened.
+    """
+
     try:
         with Image.open(image_path) as image:
             image.verify()
+
         return True
-    except (UnidentifiedImageError, OSError):
-        problems.append(f"Unreadable image: {image_path}")
+
+    except (
+        UnidentifiedImageError,
+        OSError,
+    ):
+        problems.append(
+            f"Unreadable image: {image_path}"
+        )
         return False
 
+
+# ============================================================
+# SPLIT HANDLING
+# ============================================================
+
+TRAIN_NAMES = (
+    "train",
+    "Training",
+)
+
+TEST_NAMES = (
+    "test",
+    "Test",
+)
+
+
+def _find_split_dirs(
+    directory: Path,
+    split: str,
+) -> list[Path]:
+    """
+    Find train/test folders using either capitalization.
+
+    Example:
+
+        train
+        Training
+
+        test
+        Test
+    """
+
+    if split == "train":
+        names = TRAIN_NAMES
+
+    elif split == "test":
+        names = TEST_NAMES
+
+    else:
+        raise ValueError(
+            f"Unsupported split: {split}"
+        )
+
+    return [
+        directory / name
+        for name in names
+        if (directory / name).is_dir()
+    ]
+
+
+# ============================================================
+# ADD IMAGES
+# ============================================================
 
 def _add_images(
     samples_by_split: dict[str, list[Sample]],
@@ -187,111 +188,288 @@ def _add_images(
     problems: list[str],
     image_dir: Path,
     fruit_name: str,
-    class_name: str,
+    ripeness_name: str | None,
     split: str,
 ) -> None:
-    """Add all valid images from one directory."""
+    """
+    Add all images from a directory.
 
-    class_name = normalise_label(class_name)
+    For no_fruit:
 
-    for image_path in sorted(image_dir.rglob("*")):
+        ripeness_name = None
+
+    For banana/mango:
+
+        ripeness_name = unripe / ripe / overripe
+    """
+
+    if ripeness_name is not None:
+        ripeness_name = normalise_ripeness_label(
+            ripeness_name
+        )
+
+    for image_path in sorted(
+        image_dir.rglob("*")
+    ):
+
         if not _is_image(image_path):
             continue
 
-        if not _verify_image(image_path, problems):
+        if not _verify_image(
+            image_path,
+            problems,
+        ):
             continue
 
-        samples_by_split[split].append(
-            Sample(
-                image_path=image_path,
-                fruit_name=fruit_name,
-                ripeness_name=class_name,
-            )
+        sample = Sample(
+            image_path=image_path,
+            fruit_name=fruit_name,
+            ripeness_name=ripeness_name,
         )
 
-        counts[(fruit_name, split, class_name)] += 1
+        samples_by_split[split].append(sample)
+
+        counts[
+            (
+                fruit_name,
+                split,
+                ripeness_name,
+            )
+        ] += 1
 
 
-def _find_direct_split_dirs(
+# ============================================================
+# FRUIT DATASET DISCOVERY
+# ============================================================
+
+def _discover_fruit(
     fruit_dir: Path,
-    split: str,
-) -> list[Path]:
+    fruit_name: str,
+    samples_by_split: dict[str, list[Sample]],
+    counts: Counter,
+    problems: list[str],
+) -> None:
     """
-    Find:
+    Discover banana/mango images.
 
-        fruit/train
-        fruit/Training
-        fruit/test
-        fruit/Test
+    Supports BOTH:
 
-    Only train/test are considered.
-    """
+    Structure A:
 
-    return [
-        fruit_dir / name
-        for name in SPLIT_NAMES[split]
-        if (fruit_dir / name).is_dir()
-    ]
+        banana/
+            train/
+                ripe/
+                unripe/
+                overripe/
+            test/
+                ripe/
+                unripe/
+                overripe/
 
+    Structure B:
 
-def _find_nested_class_split_dirs(
-    fruit_dir: Path,
-    split: str,
-) -> list[tuple[Path, Path]]:
-    """
-    Find structures such as:
-
-        fruit/
+        mango/
             ripe/
-                train/
+                Training/
+                Test/
             unripe/
-                train/
+                Training/
+                Test/
             overripe/
+                train/
                 test/
-
-    Returns:
-        [(class_directory, split_directory), ...]
     """
 
-    results = []
+    for split in ("train", "test"):
 
-    for class_dir in sorted(fruit_dir.iterdir()):
-        if not class_dir.is_dir():
+        # --------------------------------------------------------
+        # STRUCTURE A
+        #
+        # fruit/train/class
+        # fruit/test/class
+        # --------------------------------------------------------
+
+        direct_split_dirs = _find_split_dirs(
+            fruit_dir,
+            split,
+        )
+
+        if direct_split_dirs:
+
+            for split_dir in direct_split_dirs:
+
+                for class_dir in sorted(
+                    split_dir.iterdir()
+                ):
+
+                    if not class_dir.is_dir():
+                        continue
+
+                    class_name = normalise_ripeness_label(
+                        class_dir.name
+                    )
+
+                    _add_images(
+                        samples_by_split=samples_by_split,
+                        counts=counts,
+                        problems=problems,
+                        image_dir=class_dir,
+                        fruit_name=fruit_name,
+                        ripeness_name=class_name,
+                        split=split,
+                    )
+
             continue
 
-        # Never treat these as ripeness classes.
-        if normalise_label(class_dir.name) in {
-            "train",
-            "test",
-            "valid",
-            "training",
-            "testing",
-            "validation",
-        }:
+        # --------------------------------------------------------
+        # STRUCTURE B
+        #
+        # fruit/class/train
+        # fruit/class/test
+        # --------------------------------------------------------
+
+        found_nested = False
+
+        for class_dir in sorted(
+            fruit_dir.iterdir()
+        ):
+
+            if not class_dir.is_dir():
+                continue
+
+            # Don't treat train/test as classes.
+            if class_dir.name.lower() in {
+                "train",
+                "training",
+                "test",
+                "testing",
+                "valid",
+                "validation",
+            }:
+                continue
+
+            try:
+                ripeness_name = normalise_ripeness_label(
+                    class_dir.name
+                )
+            except ValueError:
+                continue
+
+            nested_split_dirs = _find_split_dirs(
+                class_dir,
+                split,
+            )
+
+            for split_dir in nested_split_dirs:
+
+                found_nested = True
+
+                _add_images(
+                    samples_by_split=samples_by_split,
+                    counts=counts,
+                    problems=problems,
+                    image_dir=split_dir,
+                    fruit_name=fruit_name,
+                    ripeness_name=ripeness_name,
+                    split=split,
+                )
+
+        if not found_nested:
+
+            problems.append(
+                f"Missing {split} images for "
+                f"{fruit_name}: {fruit_dir}"
+            )
+
+
+# ============================================================
+# NO-FRUIT DATASET DISCOVERY
+# ============================================================
+
+def _discover_no_fruit(
+    no_fruit_dir: Path,
+    samples_by_split: dict[str, list[Sample]],
+    counts: Counter,
+    problems: list[str],
+) -> None:
+    """
+    Discover no_fruit images.
+
+    Expected structure:
+
+        no_fruit/
+            train/
+            test/
+
+    no_fruit does NOT have a ripeness label.
+    """
+
+    if not no_fruit_dir.is_dir():
+
+        problems.append(
+            f"Missing no_fruit directory: "
+            f"{no_fruit_dir}"
+        )
+
+        return
+
+    for split in ("train", "test"):
+
+        split_dirs = _find_split_dirs(
+            no_fruit_dir,
+            split,
+        )
+
+        if not split_dirs:
+
+            problems.append(
+                f"Missing {split} images for "
+                f"no_fruit: {no_fruit_dir}"
+            )
+
             continue
 
-        for split_name in SPLIT_NAMES[split]:
-            split_dir = class_dir / split_name
+        for split_dir in split_dirs:
 
-            if split_dir.is_dir():
-                results.append((class_dir, split_dir))
+            _add_images(
+                samples_by_split=samples_by_split,
+                counts=counts,
+                problems=problems,
+                image_dir=split_dir,
+                fruit_name="no_fruit",
+                ripeness_name=None,
+                split=split,
+            )
 
-    return results
 
+# ============================================================
+# DISCOVER ALL SAMPLES
+# ============================================================
 
 def discover_samples(
     dataset_dir: Path = DATASET_DIR,
-    requested_splits: tuple[str, ...] = SPLITS,
-) -> tuple[dict[str, list[Sample]], Counter, list[str]]:
+    requested_splits: tuple[str, ...] = (
+        "train",
+        "test",
+    ),
+) -> tuple[
+    dict[str, list[Sample]],
+    Counter,
+    list[str],
+]:
     """
-    Discover image samples from ONLY train and test.
+    Discover the complete image dataset.
 
-    Validation/valid folders are intentionally ignored.
-    No files are moved, deleted, renamed, or modified.
+    ONLY train and test are used.
+
+    valid / Valid / validation folders
+    are completely ignored.
     """
 
-    # Force this function to work only with train/test.
-    allowed_splits = ("train", "test")
+    allowed_splits = {
+        "train",
+        "test",
+    }
 
     requested_splits = tuple(
         split
@@ -300,168 +478,153 @@ def discover_samples(
     )
 
     samples_by_split = {
-        split: []
-        for split in allowed_splits
+        "train": [],
+        "test": [],
     }
 
     counts = Counter()
-    problems = []
+    problems: list[str] = []
 
-    for fruit_name in FRUIT_NAMES:
-        fruit_dir = dataset_dir / fruit_name
+    # ------------------------------------------------------------
+    # BANANA
+    # ------------------------------------------------------------
 
-        if not fruit_dir.is_dir():
-            problems.append(
-                f"Missing fruit directory: {fruit_dir}"
-            )
-            continue
+    if "train" in requested_splits or "test" in requested_splits:
 
-        for split in requested_splits:
+        banana_dir = dataset_dir / "banana"
 
-            # ---------------------------------------------------------
-            # STRUCTURE 1:
-            #
-            # fruit/
-            #     train/
-            #         ripe/
-            #         unripe/
-            #         overripe/
-            #
-            # ---------------------------------------------------------
+        if banana_dir.is_dir():
 
-            direct_split_dirs = _find_direct_split_dirs(
-                fruit_dir,
-                split,
+            _discover_fruit(
+                banana_dir,
+                "banana",
+                samples_by_split,
+                counts,
+                problems,
             )
 
-            if direct_split_dirs:
-
-                for split_dir in direct_split_dirs:
-
-                    for class_dir in sorted(
-                        path
-                        for path in split_dir.iterdir()
-                        if path.is_dir()
-                    ):
-                        class_name = normalise_label(
-                            class_dir.name
-                        )
-
-                        # Extra safety: never read validation folders.
-                        if class_name in {
-                            "valid",
-                            "validation",
-                            "training",
-                            "testing",
-                        }:
-                            continue
-
-                        _add_images(
-                            samples_by_split,
-                            counts,
-                            problems,
-                            class_dir,
-                            fruit_name,
-                            class_name,
-                            split,
-                        )
-
-                continue
-
-            # ---------------------------------------------------------
-            # STRUCTURE 2:
-            #
-            # fruit/
-            #     ripe/
-            #         train/
-            #         test/
-            #     unripe/
-            #         train/
-            #         test/
-            #     overripe/
-            #         train/
-            #         test/
-            #
-            # ---------------------------------------------------------
-
-            nested_split_dirs = _find_nested_class_split_dirs(
-                fruit_dir,
-                split,
-            )
-
-            if nested_split_dirs:
-
-                for class_dir, split_dir in nested_split_dirs:
-
-                    _add_images(
-                        samples_by_split,
-                        counts,
-                        problems,
-                        split_dir,
-                        fruit_name,
-                        class_dir.name,
-                        split,
-                    )
-
-                continue
-
-            # ---------------------------------------------------------
-            # No train/test found for this fruit.
-            #
-            # We deliberately DO NOT look for:
-            #
-            #     valid/
-            #     Valid/
-            #     validation/
-            #
-            # ---------------------------------------------------------
+        else:
 
             problems.append(
-                f"Missing {split} images for {fruit_name}: "
-                f"no supported train/test structure found in "
-                f"{fruit_dir}"
+                f"Missing fruit directory: "
+                f"{banana_dir}"
             )
 
-    return samples_by_split, counts, problems
+    # ------------------------------------------------------------
+    # MANGO
+    # ------------------------------------------------------------
 
+    if "train" in requested_splits or "test" in requested_splits:
+
+        mango_dir = dataset_dir / "mango"
+
+        if mango_dir.is_dir():
+
+            _discover_fruit(
+                mango_dir,
+                "mango",
+                samples_by_split,
+                counts,
+                problems,
+            )
+
+        else:
+
+            problems.append(
+                f"Missing fruit directory: "
+                f"{mango_dir}"
+            )
+
+    # ------------------------------------------------------------
+    # NO FRUIT
+    # ------------------------------------------------------------
+
+    if "train" in requested_splits or "test" in requested_splits:
+
+        no_fruit_dir = dataset_dir / "no_fruit"
+
+        _discover_no_fruit(
+            no_fruit_dir,
+            samples_by_split,
+            counts,
+            problems,
+        )
+
+    # ------------------------------------------------------------
+    # Remove samples from splits that weren't requested.
+    # ------------------------------------------------------------
+
+    for split in ("train", "test"):
+
+        if split not in requested_splits:
+            samples_by_split[split] = []
+
+    return (
+        samples_by_split,
+        counts,
+        problems,
+    )
+
+
+# ============================================================
+# FLAT IMAGE SCANNER
+# ============================================================
 
 def scan_images(
     dataset_dir: Path = DATASET_DIR,
 ) -> tuple[
-    list[tuple[Path, str, str]],
+    list[tuple[Path, str, str | None]],
     Counter,
     list[str],
 ]:
     """
-    Scan ONLY train and test images.
+    Scan all train/test images.
 
-    The valid folder is completely ignored.
+    Returns:
+
+        image_path
+        fruit_name
+        ripeness_name
+
+    no_fruit has:
+
+        ripeness_name = None
     """
 
-    samples_by_split, counts, problems = discover_samples(
-        dataset_dir,
-        ("train", "test"),
+    samples_by_split, counts, problems = (
+        discover_samples(
+            dataset_dir,
+            ("train", "test"),
+        )
     )
 
-    flattened = [
-        (
-            sample.image_path,
-            sample.fruit_name,
-            sample.ripeness_name,
-        )
-        for split in ("train", "test")
-        for sample in samples_by_split[split]
-    ]
+    flattened = []
 
-    return flattened, counts, problems
+    for split in ("train", "test"):
+
+        for sample in samples_by_split[split]:
+
+            flattened.append(
+                (
+                    sample.image_path,
+                    sample.fruit_name,
+                    sample.ripeness_name,
+                )
+            )
+
+    return (
+        flattened,
+        counts,
+        problems,
+    )
 
 
-# ---------------------------------------------------------------------
+# ============================================================
 # PYTORCH DATASET
-# ---------------------------------------------------------------------
-
+# ============================================================
 
 class FruitDataset(Dataset):
+
     def __init__(
         self,
         samples: list[Sample],
@@ -470,40 +633,74 @@ class FruitDataset(Dataset):
         training: bool,
         image_size: int,
     ):
+
         self.samples = samples
-        self.fruit_to_index = fruit_to_index
-        self.ripeness_to_index = ripeness_to_index
+
+        self.fruit_to_index = (
+            fruit_to_index
+        )
+
+        self.ripeness_to_index = (
+            ripeness_to_index
+        )
+
+        # --------------------------------------------------------
+        # TRAINING TRANSFORMS
+        # --------------------------------------------------------
 
         if training:
+
             self.transform = transforms.Compose(
                 [
                     transforms.Resize(
-                        (image_size + 32, image_size + 32)
+                        (
+                            image_size + 32,
+                            image_size + 32,
+                        )
                     ),
+
                     transforms.RandomResizedCrop(
                         image_size,
                         scale=(0.85, 1.0),
                     ),
+
                     transforms.RandomHorizontalFlip(),
+
                     transforms.ColorJitter(
                         brightness=0.12,
                         saturation=0.12,
                     ),
+
                     transforms.ToTensor(),
+
                     transforms.Normalize(
                         [0.485, 0.456, 0.406],
                         [0.229, 0.224, 0.225],
                     ),
                 ]
             )
+
+        # --------------------------------------------------------
+        # TEST TRANSFORMS
+        # --------------------------------------------------------
+
         else:
+
             self.transform = transforms.Compose(
                 [
                     transforms.Resize(
-                        (image_size + 32, image_size + 32)
+                        (
+                            image_size + 32,
+                            image_size + 32,
+                        )
                     ),
-                    transforms.CenterCrop(image_size),
+
+                    transforms.CenterCrop(
+                        image_size
+                    ),
+
                     transforms.ToTensor(),
+
                     transforms.Normalize(
                         [0.485, 0.456, 0.406],
                         [0.229, 0.224, 0.225],
@@ -514,55 +711,115 @@ class FruitDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> dict:
+    def __getitem__(
+        self,
+        index: int,
+    ) -> dict:
+
         sample = self.samples[index]
 
-        with Image.open(sample.image_path) as image:
+        # --------------------------------------------------------
+        # IMAGE
+        # --------------------------------------------------------
+
+        with Image.open(
+            sample.image_path
+        ) as image:
+
             image_tensor = self.transform(
                 image.convert("RGB")
             )
 
+        # --------------------------------------------------------
+        # FRUIT LABEL
+        # --------------------------------------------------------
+
+        fruit_index = self.fruit_to_index[
+            sample.fruit_name
+        ]
+
+        # --------------------------------------------------------
+        # RIPENESS LABEL
+        #
+        # no_fruit has no ripeness.
+        #
+        # We use -1 so train.py can ignore this target.
+        # --------------------------------------------------------
+
+        if sample.ripeness_name is None:
+
+            ripeness_index = -1
+
+        else:
+
+            ripeness_index = (
+                self.ripeness_to_index[
+                    sample.ripeness_name
+                ]
+            )
+
+        # --------------------------------------------------------
+        # RETURN
+        # --------------------------------------------------------
+
         return {
             "image": image_tensor,
-            "fruit": self.fruit_to_index[
-                sample.fruit_name
-            ],
-            "ripeness": self.ripeness_to_index[
-                sample.ripeness_name
-            ],
+
+            "fruit": fruit_index,
+
+            "ripeness": ripeness_index,
+
             "temperature": (
                 float("nan")
                 if sample.temperature is None
-                else sample.temperature
+                else float(sample.temperature)
             ),
+
             "humidity": (
                 float("nan")
                 if sample.humidity is None
-                else sample.humidity
+                else float(sample.humidity)
             ),
+
             "days_remaining": (
                 float("nan")
                 if sample.days_remaining is None
-                else sample.days_remaining
+                else float(sample.days_remaining)
             ),
-            "path": str(sample.image_path),
+
+            "path": str(
+                sample.image_path
+            ),
         }
 
+
+# ============================================================
+# NUMBER VALIDATION
+# ============================================================
 
 def validate_number(
     value: str,
     field: str,
 ) -> float:
-    """Validate a numeric CSV value."""
+    """
+    Validate a numeric value.
+    """
 
     try:
+
         parsed = float(value)
-    except (TypeError, ValueError) as error:
+
+    except (
+        TypeError,
+        ValueError,
+    ) as error:
+
         raise ValueError(
             f"Invalid {field}: {value!r}"
         ) from error
 
     if not math.isfinite(parsed):
+
         raise ValueError(
             f"Invalid {field}: {value!r}"
         )
