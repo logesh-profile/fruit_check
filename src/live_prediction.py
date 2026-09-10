@@ -1,6 +1,4 @@
-import sys
 from pathlib import Path
-
 import cv2
 import numpy as np
 import torch
@@ -8,168 +6,133 @@ from PIL import Image
 from torchvision import transforms
 from ultralytics import YOLO
 
-# Add src to sys.path
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.append(str(PROJECT_ROOT / "src"))
-
-from days_model import DaysRemainingMLP
 from model import FruitRipenessModel
 
 
 def main() -> None:
-    device = torch.device("cpu")
-    print("=" * 60)
-    print("FRUIT RIPENESS AI SYSTEM — YOLOV8 HYBRID INFERENCE")
-    print("=" * 60)
+    project_root = Path(__file__).resolve().parents[1]
+    checkpoint_path = project_root / "models" / "best_model.pth"
 
-    # 1. LOAD YOLOV8 DETECTOR
-    # Pretrained YOLOv8n contains COCO classes (e.g. 'banana' = class 46)
-    print("Loading YOLOv8 Object Detector...")
-    yolo_model = YOLO("yolov8n.pt")
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Model checkpoint not found: {checkpoint_path}")
 
-    # 2. LOAD EFFICIENTNET MODEL
-    models_dir = PROJECT_ROOT / "models"
-    img_checkpoint_path = models_dir / "best_model.pth"
-    mlp_checkpoint_path = models_dir / "days_model.pth"
+    print(f"Loading EfficientNet checkpoint: {checkpoint_path}")
 
-    if not img_checkpoint_path.exists():
-        raise FileNotFoundError(f"Missing {img_checkpoint_path}")
+    # ---------------------------------------------------------
+    # 1. LOAD EFFICIENTNET MODEL
+    # ---------------------------------------------------------
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=torch.device("cpu"),
+        weights_only=False,
+    )
 
-    print(f"Loading EfficientNet Model: {img_checkpoint_path.name}")
-    img_checkpoint = torch.load(img_checkpoint_path, map_location=device, weights_only=False)
+    fruit_to_index = checkpoint["fruit_to_index"]
+    ripeness_to_index = checkpoint["ripeness_to_index"]
 
-    fruit_to_index = img_checkpoint["fruit_to_index"]
-    ripeness_to_index = img_checkpoint["ripeness_to_index"]
+    num_fruit_classes = checkpoint.get("num_fruit_classes", len(fruit_to_index))
+    num_ripeness_classes = checkpoint.get("num_ripeness_classes", len(ripeness_to_index))
 
-    index_to_fruit = {index: name for name, index in fruit_to_index.items()}
-    index_to_ripeness = {index: name for name, index in ripeness_to_index.items()}
-
-    img_model = FruitRipenessModel(
-        num_ripeness_classes=len(ripeness_to_index),
-        num_fruit_classes=len(fruit_to_index),
+    classifier = FruitRipenessModel(
+        num_ripeness_classes=num_ripeness_classes,
+        num_fruit_classes=num_fruit_classes,
         pretrained=False,
     )
-    img_model.load_state_dict(img_checkpoint["model_state"])
-    img_model.eval()
+    classifier.load_state_dict(checkpoint["model_state"])
+    classifier.eval()
 
-    # 3. LOAD DAYS REMAINING MLP MODEL
-    print(f"Loading Days Model: {mlp_checkpoint_path.name}")
-    mlp_checkpoint = torch.load(mlp_checkpoint_path, map_location=device, weights_only=False)
+    index_to_fruit = {v: k for k, v in fruit_to_index.items()}
+    index_to_ripeness = {v: k for k, v in ripeness_to_index.items()}
 
-    mlp_model = DaysRemainingMLP(input_dim=mlp_checkpoint["input_dim"])
-    mlp_model.load_state_dict(mlp_checkpoint["model_state"])
-    mlp_model.eval()
-
-    temp_mean = mlp_checkpoint["temperature_mean"]
-    temp_scale = mlp_checkpoint["temperature_scale"]
-    hum_mean = mlp_checkpoint["humidity_mean"]
-    hum_scale = mlp_checkpoint["humidity_scale"]
-
-    # Environmental Sensor Values
-    current_temp = 28.0
-    current_hum = 70.0
-
-    # 4. PREPROCESSING PIPELINE FOR CROPS
-    image_size = img_checkpoint.get("image_size", 384)
     transform = transforms.Compose([
-        transforms.Resize((image_size, image_size)),
+        transforms.Resize((checkpoint["image_size"], checkpoint["image_size"])),
         transforms.ToTensor(),
         transforms.Normalize(
-            mean=img_checkpoint["normalization"]["mean"],
-            std=img_checkpoint["normalization"]["std"]
-        )
+            checkpoint["normalization"]["mean"],
+            checkpoint["normalization"]["std"],
+        ),
     ])
 
-    # 5. LIVE CAMERA LOOP
+    # ---------------------------------------------------------
+    # 2. LOAD YOLO DETECTOR & DEFINE TARGET CLASSES
+    # COCO class IDs: 46 = banana, 47 = apple, 49 = orange
+    # ---------------------------------------------------------
+    print("Loading YOLOv8 detector...")
+    yolo_model = YOLO("yolov8n.pt")
+
+    # Target COCO class IDs for generic fruit detection
+    ALLOWED_YOLO_CLASSES = [46, 47, 49]  # Banana, Apple, Orange
+
+    # Set minimum confidence threshold (drops weak/unknown predictions)
+    CONFIDENCE_THRESHOLD = 0.65
+
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        raise RuntimeError("Camera index 0 could not be opened.")
+        print("Error: Could not open camera.")
+        return
 
-    print("\nStarting camera feed... Press 'q' to stop.")
+    print("\nStarting Real-Time Detection...")
+    print("Press 'q' to quit.\n")
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Run YOLOv8 Object Detection on full frame
-        yolo_results = yolo_model(frame, verbose=False)[0]
-        boxes = yolo_results.boxes
+        # ---------------------------------------------------------
+        # STAGE 1: DETECT OBJECTS WITH CLASS FILTERING
+        # classes=ALLOWED_YOLO_CLASSES ensures persons, chairs, etc. are IGNORED
+        # ---------------------------------------------------------
+        results = yolo_model(frame, verbose=False, conf=0.40, classes=ALLOWED_YOLO_CLASSES)[0]
 
-        fruit_detected_in_frame = False
+        for box in results.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
 
-        if len(boxes) > 0:
-            for box in boxes:
-                # Extract coordinates and bounding metadata
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                cls_id = int(box.cls[0])
-                confidence = float(box.conf[0])
+            # Crop ROI
+            crop = frame[max(0, y1):min(frame.shape[0], y2), max(0, x1):min(frame.shape[1], x2)]
+            if crop.size == 0:
+                continue
 
-                # Get predicted class label from YOLO
-                yolo_label = yolo_model.names[cls_id].lower()
+            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            pil_crop = Image.fromarray(crop_rgb)
+            image_tensor = transform(pil_crop).unsqueeze(0)
 
-                # Filter target classes (e.g., banana, apple, orange, or custom trained mango)
-                if yolo_label in ["banana", "apple", "orange"] and confidence > 0.40:
-                    fruit_detected_in_frame = True
+            # ---------------------------------------------------------
+            # STAGE 2: CLASSIFY CROPPED FRUIT
+            # ---------------------------------------------------------
+            with torch.no_grad():
+                features = classifier.encode_image(image_tensor)
 
-                    # Extract Bounding Box Crop
-                    crop_bgr = frame[y1:y2, x1:x2]
-                    if crop_bgr.size == 0:
-                        continue
+                # Fruit prediction
+                fruit_logits = classifier.fruit_head(features)
+                fruit_probs = torch.softmax(fruit_logits, dim=1)
+                fruit_idx = fruit_logits.argmax(dim=1).item()
+                fruit_name = index_to_fruit[fruit_idx]
+                fruit_conf = fruit_probs[0, fruit_idx].item()
 
-                    # Convert BGR to RGB for PyTorch Processing
-                    crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-                    pil_image = Image.fromarray(crop_rgb)
-                    input_tensor = transform(pil_image).unsqueeze(0).to(device)
+                # Ripeness prediction
+                ripeness_logits = classifier.ripeness_head(features)
+                ripeness_probs = torch.softmax(ripeness_logits, dim=1)
+                ripeness_idx = ripeness_logits.argmax(dim=1).item()
+                ripeness_name = index_to_ripeness[ripeness_idx]
+                ripeness_conf = ripeness_probs[0, ripeness_idx].item()
 
-                    # EfficientNet Inference
-                    with torch.no_grad():
-                        features = img_model.encode_image(input_tensor)
+            # FLAW FIX: If classifier confidence is lower than threshold, mark as Unknown
+            if fruit_conf < CONFIDENCE_THRESHOLD:
+                label = "Unknown Object"
+                color = (0, 0, 255)  # Red for unknown
+            else:
+                label = f"{fruit_name.title()} ({fruit_conf * 100:.0f}%) | {ripeness_name.title()} ({ripeness_conf * 100:.0f}%)"
+                color = (0, 255, 0)  # Green for valid fruits
 
-                        # Predict Fruit Type
-                        fruit_logits = img_model.fruit_head(features)
-                        fruit_idx = fruit_logits.argmax(dim=1).item()
-                        fruit_name = index_to_fruit.get(fruit_idx, "banana")
+            # Draw bounding box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.rectangle(frame, (x1, y1 - 30), (x1 + len(label) * 11, y1), color, -1)
+            cv2.putText(frame, label, (x1 + 5, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
 
-                        # Predict Ripeness Stage
-                        ripeness_logits = img_model.ripeness_head(features)
-                        ripeness_probs = torch.softmax(ripeness_logits, dim=1)
-                        ripeness_idx = ripeness_logits.argmax(dim=1).item()
-                        ripeness_name = index_to_ripeness.get(ripeness_idx, "ripe")
-                        ripeness_conf = ripeness_probs[0, ripeness_idx].item() * 100
+        cv2.imshow("Fruit & Ripeness Detector", frame)
 
-                        # Calculate Days Remaining with MLP
-                        fruit_oh = [1.0, 0.0] if fruit_name == "banana" else [0.0, 1.0]
-                        stage_oh = [0.0, 0.0, 0.0]
-                        if ripeness_name == "unripe":
-                            stage_oh[0] = 1.0
-                        elif ripeness_name == "ripe":
-                            stage_oh[1] = 1.0
-                        elif ripeness_name == "overripe":
-                            stage_oh[2] = 1.0
-
-                        norm_temp = (current_temp - temp_mean) / temp_scale
-                        norm_hum = (current_hum - hum_mean) / hum_scale
-
-                        mlp_in = torch.tensor([fruit_oh + stage_oh + [norm_temp, norm_hum]], dtype=torch.float32)
-                        days_remaining = max(0.0, mlp_model(mlp_in).item())
-
-                    # Draw Bounding Box & Labels
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    label_str = f"{fruit_name.title()} | {ripeness_name.title()} ({ripeness_conf:.0f}%)"
-                    days_str = f"Days Left: {days_remaining:.1f}"
-
-                    cv2.putText(frame, label_str, (x1, max(y1 - 25, 20)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                    cv2.putText(frame, days_str, (x1, max(y1 - 5, 40)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-
-        if not fruit_detected_in_frame:
-            cv2.putText(frame, "Status: Searching for Fruit...", (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
-        cv2.imshow("Fruit Ripeness AI System", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
     cap.release()

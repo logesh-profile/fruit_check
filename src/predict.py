@@ -11,7 +11,7 @@ from model import FruitRipenessModel
 # HARDCODED IMAGE PATH SETTING
 # Replace this path with the exact image you want to test
 # =========================================================
-DEFAULT_IMAGE_PATH = r"C:\fruit_checking\dataset\banana_unripe1.jpg"
+DEFAULT_IMAGE_PATH = r"C:\fruit_checking\dataset\banana_overripe2.jpg"
 
 
 def predict_image(image_path: Path) -> None:
