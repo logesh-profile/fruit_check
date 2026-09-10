@@ -15,13 +15,7 @@ def main() -> None:
         description="Evaluate the held-out test split."
     )
 
-    # Automatically locate the project root:
-    # C:\fruit_checking\src\evaluate.py
-    # -> C:\fruit_checking
     project_root = Path(__file__).resolve().parents[1]
-
-    # Automatically use:
-    # C:\fruit_checking\models\best_model.pth
     default_checkpoint = project_root / "models" / "best_model.pth"
 
     parser.add_argument(
@@ -50,10 +44,18 @@ def main() -> None:
     fruit_to_index = checkpoint["fruit_to_index"]
     ripeness_to_index = checkpoint["ripeness_to_index"]
 
+    num_fruit_classes = checkpoint.get(
+        "num_fruit_classes",
+        len(fruit_to_index),
+    )
+
+    num_ripeness_classes = checkpoint.get(
+        "num_ripeness_classes",
+        len(ripeness_to_index),
+    )
+
     # ---------------------------------------------------------
-    # IMPORTANT:
     # Only the TEST split is used here.
-    # No validation data is used.
     # ---------------------------------------------------------
     samples_by_split, _, problems = discover_samples(
         DATASET_DIR,
@@ -88,9 +90,10 @@ def main() -> None:
         num_workers=NUM_WORKERS,
     )
 
-    # Recreate model architecture
+    # Recreate model architecture with exact class counts
     model = FruitRipenessModel(
-        len(ripeness_to_index),
+        num_ripeness_classes=num_ripeness_classes,
+        num_fruit_classes=num_fruit_classes,
         pretrained=False,
     )
 

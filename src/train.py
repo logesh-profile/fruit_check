@@ -30,17 +30,13 @@ def build_mappings(
     always use the same class indices.
 
     Fruit:
-        banana   -> 0
-        mango    -> 1
-        no_fruit -> 2
+        banana -> 0
+        mango  -> 1
 
     Ripeness:
         overripe -> 0
         ripe     -> 1
         unripe   -> 2
-
-    No_Fruit samples have no ripeness label, so None
-    values are ignored when building ripeness mappings.
     """
 
     # ---------------------------------------------------------
@@ -49,7 +45,6 @@ def build_mappings(
     fruit_to_index = {
         "banana": 0,
         "mango": 1,
-        "no_fruit": 2,
     }
 
     # ---------------------------------------------------------
@@ -161,13 +156,10 @@ def _run_classification_epoch(
     Run one image-classification epoch.
 
     Fruit classification:
-        banana / mango / no_fruit
+        banana / mango
 
     Ripeness classification:
         unripe / ripe / overripe
-
-    No_Fruit samples have ripeness = -1 and therefore
-    are excluded from the ripeness loss and accuracy.
     """
 
     if training:
@@ -180,8 +172,7 @@ def _run_classification_epoch(
     correct_fruit = 0
     correct_ripeness = 0
 
-    total_fruit = 0
-    total_ripeness = 0
+    total_samples = 0
 
     for batch in loader:
 
@@ -234,54 +225,17 @@ def _run_classification_epoch(
                 )
 
                 # -------------------------------------------------
-                # Fruit loss
-                #
-                # ALL images participate:
-                # banana + mango + no_fruit
+                # Losses computation
                 # -------------------------------------------------
                 fruit_loss_value = fruit_loss(
                     fruit_logits,
                     fruit_targets,
                 )
 
-                # -------------------------------------------------
-                # Ripeness loss
-                #
-                # ONLY actual fruit images participate.
-                #
-                # No_Fruit has target = -1.
-                # -------------------------------------------------
-                valid_ripeness_mask = (
-                    ripeness_targets >= 0
+                ripeness_loss_value = ripeness_loss(
+                    ripeness_logits,
+                    ripeness_targets,
                 )
-
-                if valid_ripeness_mask.any():
-
-                    valid_ripeness_logits = (
-                        ripeness_logits[
-                            valid_ripeness_mask
-                        ]
-                    )
-
-                    valid_ripeness_targets = (
-                        ripeness_targets[
-                            valid_ripeness_mask
-                        ]
-                    )
-
-                    ripeness_loss_value = (
-                        ripeness_loss(
-                            valid_ripeness_logits,
-                            valid_ripeness_targets,
-                        )
-                    )
-
-                else:
-
-                    ripeness_loss_value = torch.zeros(
-                        (),
-                        device=device,
-                    )
 
                 # -------------------------------------------------
                 # Combined loss
@@ -336,48 +290,33 @@ def _run_classification_epoch(
             == fruit_targets
         ).sum().item()
 
-        total_fruit += batch_size
-
         # ---------------------------------------------------------
         # Ripeness accuracy
-        # Only actual fruit images.
         # ---------------------------------------------------------
-        if valid_ripeness_mask.any():
+        ripeness_predictions = (
+            ripeness_logits.argmax(dim=1)
+        )
 
-            ripeness_predictions = (
-                ripeness_logits.argmax(
-                    dim=1
-                )
-            )
+        correct_ripeness += (
+            ripeness_predictions
+            == ripeness_targets
+        ).sum().item()
 
-            correct_ripeness += (
-                ripeness_predictions[
-                    valid_ripeness_mask
-                ]
-                == ripeness_targets[
-                    valid_ripeness_mask
-                ]
-            ).sum().item()
+        total_samples += batch_size
 
-            total_ripeness += (
-                valid_ripeness_mask.sum().item()
-            )
-
-    if total_fruit == 0:
+    if total_samples == 0:
         raise RuntimeError(
             "The training dataset contains "
             "no valid images."
         )
 
     return {
-        "loss": total_loss / total_fruit,
+        "loss": total_loss / total_samples,
         "fruit_accuracy": (
-            correct_fruit / total_fruit
+            correct_fruit / total_samples
         ),
         "ripeness_accuracy": (
-            correct_ripeness / total_ripeness
-            if total_ripeness > 0
-            else 0.0
+            correct_ripeness / total_samples
         ),
     }
 
@@ -390,8 +329,6 @@ def save_checkpoint(
 ):
     """
     Save the best image-classification checkpoint.
-
-    Regression is NOT trained in this phase.
     """
 
     MODEL_DIR.mkdir(
@@ -722,9 +659,6 @@ def train_model() -> None:
 
     # ---------------------------------------------------------
     # BEST TRAINING LOSS
-    #
-    # No validation.
-    # Test is not used here.
     # ---------------------------------------------------------
     best_loss = float("inf")
 

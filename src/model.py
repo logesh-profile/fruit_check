@@ -13,18 +13,17 @@ class FruitRipenessModel(nn.Module):
     Fruit classes:
         0 -> banana
         1 -> mango
-        2 -> no_fruit
 
     Ripeness classes:
-        0 -> unripe
+        0 -> overripe
         1 -> ripe
-        2 -> overripe
+        2 -> unripe
     """
 
     def __init__(
         self,
         num_ripeness_classes: int,
-        num_fruit_classes: int = 3,
+        num_fruit_classes: int = 2,
         pretrained: bool = True,
     ):
         super().__init__()
@@ -65,7 +64,6 @@ class FruitRipenessModel(nn.Module):
         #
         # banana
         # mango
-        # no_fruit
         # --------------------------------------------------------
 
         self.fruit_head = nn.Linear(
@@ -76,9 +74,9 @@ class FruitRipenessModel(nn.Module):
         # --------------------------------------------------------
         # RIPENESS CLASSIFICATION HEAD
         #
-        # unripe
-        # ripe
         # overripe
+        # ripe
+        # unripe
         # --------------------------------------------------------
 
         self.ripeness_head = nn.Linear(

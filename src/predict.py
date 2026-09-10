@@ -1,3 +1,4 @@
+import argparse
 from pathlib import Path
 
 import torch
@@ -6,17 +7,15 @@ from torchvision import transforms
 
 from model import FruitRipenessModel
 
+# =========================================================
+# HARDCODED IMAGE PATH SETTING
+# Replace this path with the exact image you want to test
+# =========================================================
+DEFAULT_IMAGE_PATH = r"C:\fruit_checking\dataset\banana_unripe1.jpg"
 
-def main() -> None:
-    # ---------------------------------------------------------
-    # IMAGE TO TEST
-    # ---------------------------------------------------------
-    image_path = Path(
-        r"C:\fruit_checking\dataset\no_fruit\train\image_000008.jpg" )
 
-    # ---------------------------------------------------------
-    # PATHS
-    # ---------------------------------------------------------
+def predict_image(image_path: Path) -> None:
+
     project_root = Path(__file__).resolve().parents[1]
     checkpoint_path = project_root / "models" / "best_model.pth"
 
@@ -45,7 +44,6 @@ def main() -> None:
     fruit_to_index = checkpoint["fruit_to_index"]
     ripeness_to_index = checkpoint["ripeness_to_index"]
 
-    # Number of classes saved during training
     num_fruit_classes = checkpoint.get(
         "num_fruit_classes",
         len(fruit_to_index),
@@ -107,6 +105,9 @@ def main() -> None:
             image_tensor
         )
 
+        # -----------------------------------------------------
+        # FRUIT PREDICTION
+        # -----------------------------------------------------
         fruit_logits = model.fruit_head(
             image_features
         )
@@ -135,34 +136,7 @@ def main() -> None:
         )
 
         # -----------------------------------------------------
-        # NO-FRUIT CHECK
-        # -----------------------------------------------------
-        if fruit_name == "no_fruit":
-
-            print()
-            print("=" * 55)
-            print("FRUIT RIPENESS PREDICTION")
-            print("=" * 55)
-
-            print(
-                f"Object Type       : No Fruit / Unknown Object"
-            )
-            print(
-                f"Confidence        : {fruit_confidence:.2f}%"
-            )
-
-            print()
-            print(
-                "Result            : This type of object is not trained."
-            )
-
-            print("=" * 55)
-
-            return
-
-        # -----------------------------------------------------
         # RIPENESS PREDICTION
-        # Only performed for Banana / Mango
         # -----------------------------------------------------
         ripeness_logits = model.ripeness_head(
             image_features
@@ -200,33 +174,49 @@ def main() -> None:
     print("=" * 55)
 
     print(
-        f"Fruit Type        : {fruit_name.title()}"
+        f"Fruit Type          : {fruit_name.title()}"
     )
 
     print(
-        f"Fruit Confidence  : {fruit_confidence:.2f}%"
+        f"Fruit Confidence    : {fruit_confidence:.2f}%"
     )
 
     print(
-        f"Ripeness Stage    : {ripeness_name.title()}"
+        f"Ripeness Stage      : {ripeness_name.title()}"
     )
 
     print(
-        f"Ripeness Confidence : "
-        f"{ripeness_confidence:.2f}%"
+        f"Ripeness Confidence : {ripeness_confidence:.2f}%"
     )
 
     print()
     print(
-        "Predicted Time    : unavailable"
+        "Predicted Time      : unavailable"
     )
 
     print(
-        "Reason            : "
-        "MLP prediction will be connected later."
+        "Reason              : MLP prediction will be connected later."
     )
 
     print("=" * 55)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Run fruit and ripeness prediction on a single image."
+    )
+
+    # Made --image_path optional with DEFAULT_IMAGE_PATH as fallback
+    parser.add_argument(
+        "--image_path",
+        type=str,
+        default=DEFAULT_IMAGE_PATH,
+        help="Path to the image file to run prediction on.",
+    )
+
+    args = parser.parse_args()
+
+    predict_image(Path(args.image_path))
 
 
 if __name__ == "__main__":

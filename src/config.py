@@ -1,13 +1,31 @@
 from pathlib import Path
 
+# ============================================================
+# PATHS
+# ============================================================
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATASET_DIR = PROJECT_ROOT / "dataset"
 CSV_PATH = DATASET_DIR / "prediction_datas.csv"
 MODEL_DIR = PROJECT_ROOT / "models"
 RESULTS_DIR = PROJECT_ROOT / "results"
 CHECKPOINT_PATH = MODEL_DIR / "best_model.pth"
+
+# ============================================================
+# DATASET & MODEL CONFIGURATION
+# ============================================================
+
+FRUIT_NAMES = ("banana", "mango")
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+SPLITS = ("train", "test")
+
 IMAGE_SIZE = 384
 BATCH_SIZE = 8
+
+# ============================================================
+# TRAINING HYPERPARAMETERS
+# ============================================================
+
 NUM_EPOCHS = 30
 STAGE_1_EPOCHS = 5
 
@@ -20,6 +38,3 @@ REGRESSION_LOSS_WEIGHT = 0.5
 EARLY_STOPPING_PATIENCE = 7
 RANDOM_SEED = 42
 RANGE_HALF_WIDTH = 0.5
-SPLITS = ("train","test")
-FRUIT_NAMES = ("banana", "mango")
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}

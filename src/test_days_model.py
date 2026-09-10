@@ -1,4 +1,5 @@
 import argparse
+import math
 from pathlib import Path
 
 import torch
@@ -167,16 +168,21 @@ def prediction_range(
     if days <= 0.5:
         return "0 days"
 
+    # Create a whole-day range
     lower = max(
-        0.0,
-        days - mae,
+        0,
+        math.floor(days - mae)
     )
 
-    upper = days + mae
-
-    return (
-        f"{lower:.1f}-{upper:.1f} days"
+    upper = math.ceil(
+        days + mae
     )
+
+    # Make sure upper is greater than lower
+    if upper <= lower:
+        upper = lower + 1
+
+    return f"{lower}-{upper} days"
 
 
 def main() -> None:
@@ -289,13 +295,12 @@ def main() -> None:
 
     print("-" * 50)
 
-    print(
-        f"Predicted   : "
-        f"{days:.2f} days"
-    )
+    # ---------------------------------------------------------
+    # Show remaining days as a range
+    # ---------------------------------------------------------
 
     print(
-        f"Expected    : "
+        f"Remaining   : "
         f"{prediction_range(days, mae)}"
     )
 

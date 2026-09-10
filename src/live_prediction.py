@@ -4,994 +4,177 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+from PIL import Image
 from torchvision import transforms
+from ultralytics import YOLO
 
-# ---------------------------------------------------------
-# Allow importing project files when running this script
-# ---------------------------------------------------------
-
+# Add src to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(PROJECT_ROOT / "src"))
 
-if str(PROJECT_ROOT / "src") not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT / "src"))
-
-from model import FruitRipenessModel
 from days_model import DaysRemainingMLP
+from model import FruitRipenessModel
 
 
-# =========================================================
-# CONFIGURATION
-# =========================================================
+def main() -> None:
+    device = torch.device("cpu")
+    print("=" * 60)
+    print("FRUIT RIPENESS AI SYSTEM — YOLOV8 HYBRID INFERENCE")
+    print("=" * 60)
 
-EFFICIENTNET_MODEL_PATH = (
-    PROJECT_ROOT / "models" / "best_model.pth"
-)
+    # 1. LOAD YOLOV8 DETECTOR
+    # Pretrained YOLOv8n contains COCO classes (e.g. 'banana' = class 46)
+    print("Loading YOLOv8 Object Detector...")
+    yolo_model = YOLO("yolov8n.pt")
 
-MLP_MODEL_PATH = (
-    PROJECT_ROOT / "models" / "days_model.pth"
-)
+    # 2. LOAD EFFICIENTNET MODEL
+    models_dir = PROJECT_ROOT / "models"
+    img_checkpoint_path = models_dir / "best_model.pth"
+    mlp_checkpoint_path = models_dir / "days_model.pth"
 
-CAMERA_INDEX = 0
+    if not img_checkpoint_path.exists():
+        raise FileNotFoundError(f"Missing {img_checkpoint_path}")
 
-IMAGE_SIZE = 384
+    print(f"Loading EfficientNet Model: {img_checkpoint_path.name}")
+    img_checkpoint = torch.load(img_checkpoint_path, map_location=device, weights_only=False)
 
-# ---------------------------------------------------------
-# Temporary sensor values
-#
-# Later these will come from Raspberry Pi sensors.
-# ---------------------------------------------------------
+    fruit_to_index = img_checkpoint["fruit_to_index"]
+    ripeness_to_index = img_checkpoint["ripeness_to_index"]
 
-TEMPERATURE = 28.0
-HUMIDITY = 70.0
+    index_to_fruit = {index: name for name, index in fruit_to_index.items()}
+    index_to_ripeness = {index: name for name, index in ripeness_to_index.items()}
 
-# ---------------------------------------------------------
-# Confidence threshold
-# ---------------------------------------------------------
-
-FRUIT_CONFIDENCE_THRESHOLD = 0.70
-
-RIPENESS_CONFIDENCE_THRESHOLD = 0.60
-
-
-# =========================================================
-# IMAGE TRANSFORM
-# =========================================================
-
-IMAGE_TRANSFORM = transforms.Compose(
-    [
-        transforms.ToPILImage(),
-        transforms.Resize(
-            (IMAGE_SIZE, IMAGE_SIZE)
-        ),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[
-                0.485,
-                0.456,
-                0.406,
-            ],
-            std=[
-                0.229,
-                0.224,
-                0.225,
-            ],
-        ),
-    ]
-)
-
-
-# =========================================================
-# LOAD EFFICIENTNET
-# =========================================================
-
-def load_efficientnet():
-    print("Loading EfficientNet model...")
-
-    if not EFFICIENTNET_MODEL_PATH.exists():
-        raise FileNotFoundError(
-            f"EfficientNet model not found:\n"
-            f"{EFFICIENTNET_MODEL_PATH}"
-        )
-
-    checkpoint = torch.load(
-        EFFICIENTNET_MODEL_PATH,
-        map_location="cpu",
-        weights_only=False,
-    )
-
-    fruit_to_index = checkpoint[
-        "fruit_to_index"
-    ]
-
-    ripeness_to_index = checkpoint[
-        "ripeness_to_index"
-    ]
-
-    num_fruit_classes = checkpoint.get(
-        "num_fruit_classes",
-        len(fruit_to_index),
-    )
-
-    num_ripeness_classes = checkpoint.get(
-        "num_ripeness_classes",
-        len(ripeness_to_index),
-    )
-
-    model = FruitRipenessModel(
-        num_ripeness_classes=num_ripeness_classes,
-        num_fruit_classes=num_fruit_classes,
+    img_model = FruitRipenessModel(
+        num_ripeness_classes=len(ripeness_to_index),
+        num_fruit_classes=len(fruit_to_index),
         pretrained=False,
     )
+    img_model.load_state_dict(img_checkpoint["model_state"])
+    img_model.eval()
 
-    model.load_state_dict(
-        checkpoint["model_state"]
-    )
+    # 3. LOAD DAYS REMAINING MLP MODEL
+    print(f"Loading Days Model: {mlp_checkpoint_path.name}")
+    mlp_checkpoint = torch.load(mlp_checkpoint_path, map_location=device, weights_only=False)
 
-    model.eval()
+    mlp_model = DaysRemainingMLP(input_dim=mlp_checkpoint["input_dim"])
+    mlp_model.load_state_dict(mlp_checkpoint["model_state"])
+    mlp_model.eval()
 
-    print("EfficientNet loaded.")
+    temp_mean = mlp_checkpoint["temperature_mean"]
+    temp_scale = mlp_checkpoint["temperature_scale"]
+    hum_mean = mlp_checkpoint["humidity_mean"]
+    hum_scale = mlp_checkpoint["humidity_scale"]
 
-    print(
-        "Fruit classes:",
-        fruit_to_index,
-    )
+    # Environmental Sensor Values
+    current_temp = 28.0
+    current_hum = 70.0
 
-    print(
-        "Ripeness classes:",
-        ripeness_to_index,
-    )
-
-    return (
-        model,
-        checkpoint,
-        fruit_to_index,
-        ripeness_to_index,
-    )
-
-
-# =========================================================
-# LOAD MLP
-# =========================================================
-
-def load_mlp():
-    print("Loading MLP model...")
-
-    if not MLP_MODEL_PATH.exists():
-        raise FileNotFoundError(
-            f"MLP model not found:\n"
-            f"{MLP_MODEL_PATH}"
+    # 4. PREPROCESSING PIPELINE FOR CROPS
+    image_size = img_checkpoint.get("image_size", 384)
+    transform = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=img_checkpoint["normalization"]["mean"],
+            std=img_checkpoint["normalization"]["std"]
         )
+    ])
 
-    checkpoint = torch.load(
-        MLP_MODEL_PATH,
-        map_location="cpu",
-        weights_only=False,
-    )
+    # 5. LIVE CAMERA LOOP
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        raise RuntimeError("Camera index 0 could not be opened.")
 
-    model = DaysRemainingMLP(
-        input_dim=checkpoint["input_dim"]
-    )
-
-    model.load_state_dict(
-        checkpoint["model_state"]
-    )
-
-    model.eval()
-
-    # -----------------------------------------------------
-    # IMPORTANT:
-    #
-    # Your train_days_model.py does NOT save:
-    #
-    # checkpoint["scaler"]
-    #
-    # Instead it saves these four values directly.
-    # -----------------------------------------------------
-
-    temperature_mean = float(
-        checkpoint["temperature_mean"]
-    )
-
-    temperature_scale = float(
-        checkpoint["temperature_scale"]
-    )
-
-    humidity_mean = float(
-        checkpoint["humidity_mean"]
-    )
-
-    humidity_scale = float(
-        checkpoint["humidity_scale"]
-    )
-
-    fruit_to_index = checkpoint[
-        "fruit_to_index"
-    ]
-
-    stage_to_index = checkpoint[
-        "stage_to_index"
-    ]
-
-    best_test_mae = float(
-        checkpoint["best_test_mae"]
-    )
-
-    print("MLP loaded.")
-
-    print(
-        "MLP fruit mapping:",
-        fruit_to_index,
-    )
-
-    print(
-        "MLP stage mapping:",
-        stage_to_index,
-    )
-
-    return (
-        model,
-        checkpoint,
-        fruit_to_index,
-        stage_to_index,
-        temperature_mean,
-        temperature_scale,
-        humidity_mean,
-        humidity_scale,
-        best_test_mae,
-    )
-
-
-# =========================================================
-# EFFICIENTNET PREDICTION
-# =========================================================
-
-def predict_image(
-    model,
-    frame,
-    fruit_to_index,
-    ripeness_to_index,
-):
-    """
-    Predict fruit and ripeness from one camera frame.
-    """
-
-    # -----------------------------------------------------
-    # OpenCV uses BGR.
-    # EfficientNet expects RGB.
-    # -----------------------------------------------------
-
-    rgb = cv2.cvtColor(
-        frame,
-        cv2.COLOR_BGR2RGB,
-    )
-
-    image_tensor = IMAGE_TRANSFORM(
-        rgb
-    )
-
-    image_tensor = image_tensor.unsqueeze(0)
-
-    # -----------------------------------------------------
-    # Dummy sensor tensors.
-    #
-    # EfficientNet model contains a regression branch,
-    # but we do NOT use its regression output.
-    #
-    # The separate MLP handles days remaining.
-    # -----------------------------------------------------
-
-    temperature_tensor = torch.tensor(
-        [TEMPERATURE],
-        dtype=torch.float32,
-    )
-
-    humidity_tensor = torch.tensor(
-        [HUMIDITY],
-        dtype=torch.float32,
-    )
-
-    with torch.no_grad():
-
-        outputs = model(
-            image_tensor,
-            temperature_tensor,
-            humidity_tensor,
-        )
-
-        fruit_probabilities = torch.softmax(
-            outputs["fruit_logits"],
-            dim=1,
-        )
-
-        ripeness_probabilities = torch.softmax(
-            outputs["ripeness_logits"],
-            dim=1,
-        )
-
-    # -----------------------------------------------------
-    # Fruit prediction
-    # -----------------------------------------------------
-
-    fruit_confidence, fruit_index = (
-        torch.max(
-            fruit_probabilities,
-            dim=1,
-        )
-    )
-
-    fruit_confidence = float(
-        fruit_confidence.item()
-    )
-
-    fruit_index = int(
-        fruit_index.item()
-    )
-
-    index_to_fruit = {
-        index: fruit
-        for fruit, index in fruit_to_index.items()
-    }
-
-    fruit_name = index_to_fruit.get(
-        fruit_index,
-        "unknown",
-    )
-
-    # -----------------------------------------------------
-    # Unknown / low-confidence rejection
-    # -----------------------------------------------------
-
-    if (
-        fruit_name == "no_fruit"
-        or fruit_confidence
-        < FRUIT_CONFIDENCE_THRESHOLD
-    ):
-        return {
-            "fruit": "No Fruit",
-            "fruit_confidence": fruit_confidence,
-            "ripeness": None,
-            "ripeness_confidence": 0.0,
-        }
-
-    # -----------------------------------------------------
-    # Ripeness prediction
-    # -----------------------------------------------------
-
-    ripeness_confidence, ripeness_index = (
-        torch.max(
-            ripeness_probabilities,
-            dim=1,
-        )
-    )
-
-    ripeness_confidence = float(
-        ripeness_confidence.item()
-    )
-
-    ripeness_index = int(
-        ripeness_index.item()
-    )
-
-    index_to_ripeness = {
-        index: ripeness
-        for ripeness, index
-        in ripeness_to_index.items()
-    }
-
-    ripeness_name = index_to_ripeness.get(
-        ripeness_index,
-        "unknown",
-    )
-
-    if (
-        ripeness_confidence
-        < RIPENESS_CONFIDENCE_THRESHOLD
-    ):
-        ripeness_name = "uncertain"
-
-    return {
-        "fruit": fruit_name,
-        "fruit_confidence": fruit_confidence,
-        "ripeness": ripeness_name,
-        "ripeness_confidence": ripeness_confidence,
-    }
-
-
-# =========================================================
-# CREATE MLP INPUT
-# =========================================================
-
-def create_mlp_input(
-    fruit,
-    stage,
-    temperature,
-    humidity,
-    fruit_to_index,
-    stage_to_index,
-    temperature_mean,
-    temperature_scale,
-    humidity_mean,
-    humidity_scale,
-):
-    """
-    Create exactly the same 7 features used during MLP
-    training.
-
-    Features:
-
-        Banana
-        Mango
-        Unripe
-        Ripe
-        Overripe
-        Temperature normalized
-        Humidity normalized
-    """
-
-    # -----------------------------------------------------
-    # Normalize names
-    # -----------------------------------------------------
-
-    fruit = (
-        fruit
-        .strip()
-        .lower()
-        .replace("_", " ")
-        .replace("-", " ")
-    )
-
-    stage = (
-        stage
-        .strip()
-        .lower()
-        .replace("_", " ")
-        .replace("-", " ")
-    )
-
-    # -----------------------------------------------------
-    # Check mappings
-    # -----------------------------------------------------
-
-    if fruit not in fruit_to_index:
-        raise ValueError(
-            f"Fruit '{fruit}' not found in MLP mapping."
-        )
-
-    if stage not in stage_to_index:
-        raise ValueError(
-            f"Stage '{stage}' not found in MLP mapping."
-        )
-
-    # -----------------------------------------------------
-    # Fruit one-hot
-    # -----------------------------------------------------
-
-    fruit_features = [
-        0.0
-    ] * len(fruit_to_index)
-
-    fruit_features[
-        fruit_to_index[fruit]
-    ] = 1.0
-
-    # -----------------------------------------------------
-    # Stage one-hot
-    # -----------------------------------------------------
-
-    stage_features = [
-        0.0
-    ] * len(stage_to_index)
-
-    stage_features[
-        stage_to_index[stage]
-    ] = 1.0
-
-    # -----------------------------------------------------
-    # Temperature normalization
-    # -----------------------------------------------------
-
-    temperature_normalized = (
-        temperature
-        - temperature_mean
-    ) / temperature_scale
-
-    # -----------------------------------------------------
-    # Humidity normalization
-    # -----------------------------------------------------
-
-    humidity_normalized = (
-        humidity
-        - humidity_mean
-    ) / humidity_scale
-
-    # -----------------------------------------------------
-    # Final feature vector
-    # -----------------------------------------------------
-
-    features = (
-        fruit_features
-        + stage_features
-        + [
-            temperature_normalized,
-            humidity_normalized,
-        ]
-    )
-
-    return torch.tensor(
-        [features],
-        dtype=torch.float32,
-    )
-
-
-# =========================================================
-# MLP PREDICTION
-# =========================================================
-
-def predict_days_remaining(
-    model,
-    fruit,
-    stage,
-    temperature,
-    humidity,
-    fruit_to_index,
-    stage_to_index,
-    temperature_mean,
-    temperature_scale,
-    humidity_mean,
-    humidity_scale,
-):
-    """
-    Predict days remaining using the separately trained MLP.
-    """
-
-    input_tensor = create_mlp_input(
-        fruit=fruit,
-        stage=stage,
-        temperature=temperature,
-        humidity=humidity,
-        fruit_to_index=fruit_to_index,
-        stage_to_index=stage_to_index,
-        temperature_mean=temperature_mean,
-        temperature_scale=temperature_scale,
-        humidity_mean=humidity_mean,
-        humidity_scale=humidity_scale,
-    )
-
-    with torch.no_grad():
-
-        prediction = model(
-            input_tensor
-        )
-
-    days = float(
-        prediction.item()
-    )
-
-    # -----------------------------------------------------
-    # Prevent negative days.
-    # -----------------------------------------------------
-
-    days = max(
-        0.0,
-        days,
-    )
-
-    return days
-
-
-# =========================================================
-# DRAW TEXT
-# =========================================================
-
-def draw_text(
-    frame,
-    text,
-    position,
-    scale=0.7,
-    thickness=2,
-):
-    cv2.putText(
-        frame,
-        text,
-        position,
-        cv2.FONT_HERSHEY_SIMPLEX,
-        scale,
-        (255, 255, 255),
-        thickness,
-        cv2.LINE_AA,
-    )
-
-
-# =========================================================
-# MAIN
-# =========================================================
-
-def main():
-
-    print()
-    print("=" * 60)
-    print("LIVE FRUIT RIPENESS + DAYS PREDICTION")
-    print("=" * 60)
-
-    # -----------------------------------------------------
-    # Load EfficientNet
-    # -----------------------------------------------------
-
-    (
-        efficientnet,
-        efficientnet_checkpoint,
-        fruit_to_index,
-        ripeness_to_index,
-    ) = load_efficientnet()
-
-    # -----------------------------------------------------
-    # Load MLP
-    # -----------------------------------------------------
-
-    (
-        mlp,
-        mlp_checkpoint,
-        mlp_fruit_to_index,
-        mlp_stage_to_index,
-        temperature_mean,
-        temperature_scale,
-        humidity_mean,
-        humidity_scale,
-        best_test_mae,
-    ) = load_mlp()
-
-    # -----------------------------------------------------
-    # Open camera
-    # -----------------------------------------------------
-
-    print()
-    print(
-        f"Opening camera index {CAMERA_INDEX}..."
-    )
-
-    camera = cv2.VideoCapture(
-        CAMERA_INDEX
-    )
-
-    if not camera.isOpened():
-
-        raise RuntimeError(
-            "Could not open camera.\n"
-            "Check CAMERA_INDEX and camera permissions."
-        )
-
-    # -----------------------------------------------------
-    # Optional camera resolution
-    # -----------------------------------------------------
-
-    camera.set(
-        cv2.CAP_PROP_FRAME_WIDTH,
-        640,
-    )
-
-    camera.set(
-        cv2.CAP_PROP_FRAME_HEIGHT,
-        480,
-    )
-
-    print("Camera started.")
-    print()
-    print("Press Q to quit.")
-    print("=" * 60)
-
-    # -----------------------------------------------------
-    # Main camera loop
-    # -----------------------------------------------------
+    print("\nStarting camera feed... Press 'q' to stop.")
 
     while True:
-
-        success, frame = camera.read()
-
-        if not success:
-
-            print(
-                "Could not read frame from camera."
-            )
-
+        ret, frame = cap.read()
+        if not ret:
             break
 
-        # -------------------------------------------------
-        # EfficientNet prediction
-        # -------------------------------------------------
+        # Run YOLOv8 Object Detection on full frame
+        yolo_results = yolo_model(frame, verbose=False)[0]
+        boxes = yolo_results.boxes
 
-        try:
+        fruit_detected_in_frame = False
 
-            result = predict_image(
-                model=efficientnet,
-                frame=frame,
-                fruit_to_index=fruit_to_index,
-                ripeness_to_index=ripeness_to_index,
-            )
+        if len(boxes) > 0:
+            for box in boxes:
+                # Extract coordinates and bounding metadata
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                cls_id = int(box.cls[0])
+                confidence = float(box.conf[0])
 
-        except Exception as error:
+                # Get predicted class label from YOLO
+                yolo_label = yolo_model.names[cls_id].lower()
 
-            print(
-                f"Prediction error: {error}"
-            )
+                # Filter target classes (e.g., banana, apple, orange, or custom trained mango)
+                if yolo_label in ["banana", "apple", "orange"] and confidence > 0.40:
+                    fruit_detected_in_frame = True
 
-            draw_text(
-                frame,
-                "Prediction Error",
-                (20, 40),
-                0.9,
-                2,
-            )
+                    # Extract Bounding Box Crop
+                    crop_bgr = frame[y1:y2, x1:x2]
+                    if crop_bgr.size == 0:
+                        continue
 
-            cv2.imshow(
-                "Fruit Ripeness Detection",
-                frame,
-            )
+                    # Convert BGR to RGB for PyTorch Processing
+                    crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+                    pil_image = Image.fromarray(crop_rgb)
+                    input_tensor = transform(pil_image).unsqueeze(0).to(device)
 
-            key = cv2.waitKey(1) & 0xFF
+                    # EfficientNet Inference
+                    with torch.no_grad():
+                        features = img_model.encode_image(input_tensor)
 
-            if key == ord("q"):
-                break
+                        # Predict Fruit Type
+                        fruit_logits = img_model.fruit_head(features)
+                        fruit_idx = fruit_logits.argmax(dim=1).item()
+                        fruit_name = index_to_fruit.get(fruit_idx, "banana")
 
-            continue
+                        # Predict Ripeness Stage
+                        ripeness_logits = img_model.ripeness_head(features)
+                        ripeness_probs = torch.softmax(ripeness_logits, dim=1)
+                        ripeness_idx = ripeness_logits.argmax(dim=1).item()
+                        ripeness_name = index_to_ripeness.get(ripeness_idx, "ripe")
+                        ripeness_conf = ripeness_probs[0, ripeness_idx].item() * 100
 
-        # -------------------------------------------------
-        # Read result
-        # -------------------------------------------------
+                        # Calculate Days Remaining with MLP
+                        fruit_oh = [1.0, 0.0] if fruit_name == "banana" else [0.0, 1.0]
+                        stage_oh = [0.0, 0.0, 0.0]
+                        if ripeness_name == "unripe":
+                            stage_oh[0] = 1.0
+                        elif ripeness_name == "ripe":
+                            stage_oh[1] = 1.0
+                        elif ripeness_name == "overripe":
+                            stage_oh[2] = 1.0
 
-        fruit = result["fruit"]
+                        norm_temp = (current_temp - temp_mean) / temp_scale
+                        norm_hum = (current_hum - hum_mean) / hum_scale
 
-        fruit_confidence = result[
-            "fruit_confidence"
-        ]
+                        mlp_in = torch.tensor([fruit_oh + stage_oh + [norm_temp, norm_hum]], dtype=torch.float32)
+                        days_remaining = max(0.0, mlp_model(mlp_in).item())
 
-        ripeness = result[
-            "ripeness"
-        ]
+                    # Draw Bounding Box & Labels
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    label_str = f"{fruit_name.title()} | {ripeness_name.title()} ({ripeness_conf:.0f}%)"
+                    days_str = f"Days Left: {days_remaining:.1f}"
 
-        ripeness_confidence = result[
-            "ripeness_confidence"
-        ]
+                    cv2.putText(frame, label_str, (x1, max(y1 - 25, 20)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    cv2.putText(frame, days_str, (x1, max(y1 - 5, 40)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-        # -------------------------------------------------
-        # Display fruit confidence
-        # -------------------------------------------------
+        if not fruit_detected_in_frame:
+            cv2.putText(frame, "Status: Searching for Fruit...", (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-        draw_text(
-            frame,
-            f"Fruit: {fruit.title()}",
-            (20, 40),
-            0.8,
-            2,
-        )
-
-        draw_text(
-            frame,
-            f"Confidence: "
-            f"{fruit_confidence * 100:.1f}%",
-            (20, 75),
-            0.65,
-            2,
-        )
-
-        # -------------------------------------------------
-        # No fruit / unknown
-        # -------------------------------------------------
-
-        if (
-            fruit == "No Fruit"
-            or ripeness is None
-        ):
-
-            draw_text(
-                frame,
-                "Place Banana or Mango in view",
-                (20, 120),
-                0.65,
-                2,
-            )
-
-            draw_text(
-                frame,
-                f"Temperature: "
-                f"{TEMPERATURE:.1f} C",
-                (20, 160),
-                0.60,
-                2,
-            )
-
-            draw_text(
-                frame,
-                f"Humidity: "
-                f"{HUMIDITY:.1f} %",
-                (20, 195),
-                0.60,
-                2,
-            )
-
-        # -------------------------------------------------
-        # Known fruit
-        # -------------------------------------------------
-
-        else:
-
-            draw_text(
-                frame,
-                f"Stage: {ripeness.title()}",
-                (20, 120),
-                0.8,
-                2,
-            )
-
-            draw_text(
-                frame,
-                f"Stage Confidence: "
-                f"{ripeness_confidence * 100:.1f}%",
-                (20, 155),
-                0.60,
-                2,
-            )
-
-            draw_text(
-                frame,
-                f"Temperature: "
-                f"{TEMPERATURE:.1f} C",
-                (20, 195),
-                0.60,
-                2,
-            )
-
-            draw_text(
-                frame,
-                f"Humidity: "
-                f"{HUMIDITY:.1f} %",
-                (20, 230),
-                0.60,
-                2,
-            )
-
-            # ---------------------------------------------
-            # Days remaining
-            #
-            # Only run the MLP when:
-            #
-            #   Fruit = Banana/Mango
-            #   Stage = valid ripeness stage
-            # ---------------------------------------------
-
-            if (
-                fruit.lower()
-                in mlp_fruit_to_index
-                and ripeness.lower()
-                in mlp_stage_to_index
-            ):
-
-                try:
-
-                    days = predict_days_remaining(
-                        model=mlp,
-                        fruit=fruit,
-                        stage=ripeness,
-                        temperature=TEMPERATURE,
-                        humidity=HUMIDITY,
-                        fruit_to_index=mlp_fruit_to_index,
-                        stage_to_index=mlp_stage_to_index,
-                        temperature_mean=temperature_mean,
-                        temperature_scale=temperature_scale,
-                        humidity_mean=humidity_mean,
-                        humidity_scale=humidity_scale,
-                    )
-
-                    # -------------------------------------
-                    # Display days
-                    # -------------------------------------
-
-                    if days <= 0.5:
-
-                        days_text = (
-                            "Ready / Fully Ripe"
-                        )
-
-                    elif days < 1.0:
-
-                        days_text = (
-                            f"{days:.1f} day remaining"
-                        )
-
-                    else:
-
-                        days_text = (
-                            f"{days:.1f} days remaining"
-                        )
-
-                    draw_text(
-                        frame,
-                        days_text,
-                        (20, 275),
-                        0.8,
-                        2,
-                    )
-
-                    draw_text(
-                        frame,
-                        f"MLP Test MAE: "
-                        f"+/-{best_test_mae:.2f} days",
-                        (20, 310),
-                        0.55,
-                        1,
-                    )
-
-                except Exception as error:
-
-                    draw_text(
-                        frame,
-                        "Days prediction unavailable",
-                        (20, 275),
-                        0.60,
-                        2,
-                    )
-
-                    print(
-                        f"MLP prediction error: "
-                        f"{error}"
-                    )
-
-            else:
-
-                draw_text(
-                    frame,
-                    "MLP mapping mismatch",
-                    (20, 275),
-                    0.60,
-                    2,
-                )
-
-        # -------------------------------------------------
-        # Camera instructions
-        # -------------------------------------------------
-
-        draw_text(
-            frame,
-            "Press Q to quit",
-            (20, frame.shape[0] - 20),
-            0.55,
-            1,
-        )
-
-        # -------------------------------------------------
-        # Show frame
-        # -------------------------------------------------
-
-        cv2.imshow(
-            "Fruit Ripeness Detection",
-            frame,
-        )
-
-        # -------------------------------------------------
-        # Keyboard
-        # -------------------------------------------------
-
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord("q"):
-
+        cv2.imshow("Fruit Ripeness AI System", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-    # -----------------------------------------------------
-    # Cleanup
-    # -----------------------------------------------------
-
-    camera.release()
-
+    cap.release()
     cv2.destroyAllWindows()
 
-    print()
-    print("Camera stopped.")
-    print("Program finished.")
-
-
-# =========================================================
-# ENTRY POINT
-# =========================================================
 
 if __name__ == "__main__":
     main()

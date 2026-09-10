@@ -17,7 +17,6 @@ from config import DATASET_DIR, IMAGE_EXTENSIONS
 FRUIT_NAMES = (
     "banana",
     "mango",
-    "no_fruit",
 )
 
 RIPENESS_NAMES = (
@@ -35,7 +34,7 @@ RIPENESS_NAMES = (
 class Sample:
     image_path: Path
     fruit_name: str
-    ripeness_name: str | None = None
+    ripeness_name: str
 
     # Kept for future MLP/regression integration.
     temperature: float | None = None
@@ -188,25 +187,20 @@ def _add_images(
     problems: list[str],
     image_dir: Path,
     fruit_name: str,
-    ripeness_name: str | None,
+    ripeness_name: str,
     split: str,
 ) -> None:
     """
     Add all images from a directory.
-
-    For no_fruit:
-
-        ripeness_name = None
 
     For banana/mango:
 
         ripeness_name = unripe / ripe / overripe
     """
 
-    if ripeness_name is not None:
-        ripeness_name = normalise_ripeness_label(
-            ripeness_name
-        )
+    ripeness_name = normalise_ripeness_label(
+        ripeness_name
+    )
 
     for image_path in sorted(
         image_dir.rglob("*")
@@ -383,66 +377,6 @@ def _discover_fruit(
 
 
 # ============================================================
-# NO-FRUIT DATASET DISCOVERY
-# ============================================================
-
-def _discover_no_fruit(
-    no_fruit_dir: Path,
-    samples_by_split: dict[str, list[Sample]],
-    counts: Counter,
-    problems: list[str],
-) -> None:
-    """
-    Discover no_fruit images.
-
-    Expected structure:
-
-        no_fruit/
-            train/
-            test/
-
-    no_fruit does NOT have a ripeness label.
-    """
-
-    if not no_fruit_dir.is_dir():
-
-        problems.append(
-            f"Missing no_fruit directory: "
-            f"{no_fruit_dir}"
-        )
-
-        return
-
-    for split in ("train", "test"):
-
-        split_dirs = _find_split_dirs(
-            no_fruit_dir,
-            split,
-        )
-
-        if not split_dirs:
-
-            problems.append(
-                f"Missing {split} images for "
-                f"no_fruit: {no_fruit_dir}"
-            )
-
-            continue
-
-        for split_dir in split_dirs:
-
-            _add_images(
-                samples_by_split=samples_by_split,
-                counts=counts,
-                problems=problems,
-                image_dir=split_dir,
-                fruit_name="no_fruit",
-                ripeness_name=None,
-                split=split,
-            )
-
-
-# ============================================================
 # DISCOVER ALL SAMPLES
 # ============================================================
 
@@ -536,21 +470,6 @@ def discover_samples(
             )
 
     # ------------------------------------------------------------
-    # NO FRUIT
-    # ------------------------------------------------------------
-
-    if "train" in requested_splits or "test" in requested_splits:
-
-        no_fruit_dir = dataset_dir / "no_fruit"
-
-        _discover_no_fruit(
-            no_fruit_dir,
-            samples_by_split,
-            counts,
-            problems,
-        )
-
-    # ------------------------------------------------------------
     # Remove samples from splits that weren't requested.
     # ------------------------------------------------------------
 
@@ -573,7 +492,7 @@ def discover_samples(
 def scan_images(
     dataset_dir: Path = DATASET_DIR,
 ) -> tuple[
-    list[tuple[Path, str, str | None]],
+    list[tuple[Path, str, str]],
     Counter,
     list[str],
 ]:
@@ -585,10 +504,6 @@ def scan_images(
         image_path
         fruit_name
         ripeness_name
-
-    no_fruit has:
-
-        ripeness_name = None
     """
 
     samples_by_split, counts, problems = (
@@ -740,23 +655,11 @@ class FruitDataset(Dataset):
 
         # --------------------------------------------------------
         # RIPENESS LABEL
-        #
-        # no_fruit has no ripeness.
-        #
-        # We use -1 so train.py can ignore this target.
         # --------------------------------------------------------
 
-        if sample.ripeness_name is None:
-
-            ripeness_index = -1
-
-        else:
-
-            ripeness_index = (
-                self.ripeness_to_index[
-                    sample.ripeness_name
-                ]
-            )
+        ripeness_index = self.ripeness_to_index[
+            sample.ripeness_name
+        ]
 
         # --------------------------------------------------------
         # RETURN
